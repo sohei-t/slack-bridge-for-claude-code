@@ -1,3 +1,7 @@
+![CI](https://github.com/sohei-t/slack-bridge-for-claude-code/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+
 # Slack Bridge for Claude Code
 
 Bidirectional bridge between Slack and [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Control Claude Code from your phone via Slack Bot DM.

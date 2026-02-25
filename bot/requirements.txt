@@ -1,2 +1,5 @@
 slack_bolt>=1.18.0
 slack_sdk>=3.27.0
+flake8>=7.0.0
+mypy>=1.10.0
+pytest>=8.0.0
