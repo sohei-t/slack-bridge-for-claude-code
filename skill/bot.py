@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Slack <-> Claude Code Bridge Bot (Multi-session + Quick Actions)
-Receives messages from Slack DM and sends them to Claude Code running in tmux.
+Slack → Claude Code ブリッジ Bot（マルチセッション対応）
+Slack DM で受け取ったメッセージを tmux 内の Claude Code に送信する
 
-Usage:
-  Slack DM:
-    run tests                   -> Auto-send if 1 session, button picker if multiple
-    @worker1 run tests          -> Send directly to worker1 session
-    status                      -> Show all session statuses
-    status claude               -> Show specific session screen
-    sessions / ls               -> List sessions
-    m / menu                    -> Quick action menu
+使い方:
+  Slack DM で:
+    テスト実行して              → セッション1つなら自動送信、複数ならボタン選択
+    @worker1 テスト実行して     → 直接 worker1 セッションに送信
+    status                     → 全セッションの状態を確認
+    status claude              → 特定セッションの画面を確認
+    sessions / ls              → セッション一覧
 
-Environment variables (~/.config/ai-agents/profiles/default.env or .env):
+環境変数 (~/.config/ai-agents/profiles/default.env):
   SLACK_BOT_TOKEN=xoxb-...     # Bot User OAuth Token
-  SLACK_APP_TOKEN=xapp-...     # App-Level Token (Socket Mode)
-  SLACK_ALLOWED_USER=U...      # Your Slack User ID (security: only you can use the bot)
-  TMUX_SESSION_NAME=claude     # Default session name (default: claude)
+  SLACK_APP_TOKEN=xapp-...     # App-Level Token (Socket Mode用)
+  SLACK_ALLOWED_USER=U...      # 許可するSlackユーザーID（自分のみ）
+  TMUX_SESSION_NAME=claude     # デフォルトセッション名 (default: claude)
 """
 
 import json
@@ -29,86 +28,59 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-# --- Configuration ---
+# --- 設定読み込み ---
+
+ENV_FILE = Path.home() / ".config/ai-agents/profiles/default.env"
 
 
-def load_env_file(path: Path) -> dict:
-    """Load key=value pairs from an env file."""
+def load_env():
+    """default.env から環境変数を読み込む"""
+    if not ENV_FILE.exists():
+        raise FileNotFoundError(f"{ENV_FILE} が見つかりません")
     env = {}
-    if not path.exists():
-        return env
-    for line in path.read_text().splitlines():
+    for line in ENV_FILE.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, value = line.partition("=")
-            value = value.split("#")[0].strip() if "#" in value else value.strip()
-            env[key.strip()] = value
+            env[key.strip()] = value.strip()
     return env
 
 
-def get_config() -> dict:
-    """Get configuration from environment variables, falling back to .env files."""
-    env_files = [
-        Path(".env"),
-        Path.home() / ".config/ai-agents/profiles/default.env",
-    ]
+env = load_env()
 
-    file_env = {}
-    for f in env_files:
-        loaded = load_env_file(f)
-        for k, v in loaded.items():
-            if k not in file_env:
-                file_env[k] = v
-
-    def get(key: str, default: str = "") -> str:
-        return os.environ.get(key, file_env.get(key, default))
-
-    return {
-        "bot_token": get("SLACK_BOT_TOKEN"),
-        "app_token": get("SLACK_APP_TOKEN"),
-        "allowed_user": get("SLACK_ALLOWED_USER"),
-        "tmux_session": get("TMUX_SESSION_NAME", "claude"),
-    }
-
-
-config = get_config()
-
-SLACK_BOT_TOKEN = config["bot_token"]
-SLACK_APP_TOKEN = config["app_token"]
-SLACK_ALLOWED_USER = config["allowed_user"]
-DEFAULT_SESSION = config["tmux_session"]
+SLACK_BOT_TOKEN = env.get("SLACK_BOT_TOKEN", "")
+SLACK_APP_TOKEN = env.get("SLACK_APP_TOKEN", "")
+SLACK_ALLOWED_USER = env.get("SLACK_ALLOWED_USER", "")
+DEFAULT_SESSION = env.get("TMUX_SESSION_NAME", "claude")
 
 if not SLACK_BOT_TOKEN:
-    raise ValueError("SLACK_BOT_TOKEN is not set")
+    raise ValueError("SLACK_BOT_TOKEN が未設定です")
 if not SLACK_APP_TOKEN:
-    raise ValueError("SLACK_APP_TOKEN is not set")
+    raise ValueError("SLACK_APP_TOKEN が未設定です")
 if not SLACK_ALLOWED_USER:
-    raise ValueError("SLACK_ALLOWED_USER is not set (required for security)")
+    raise ValueError("SLACK_ALLOWED_USER が未設定です（セキュリティのため必須）")
 
-# --- Logging ---
-
-LOG_DIR = Path.home() / ".claude/slack-bot"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+# --- ログ設定 ---
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "bot.log"),
+        logging.FileHandler(Path.home() / ".claude/slack-bot/bot.log"),
         logging.StreamHandler(),
     ],
 )
 log = logging.getLogger(__name__)
 
-# --- Pending messages (for button selection) ---
+# --- 保留メッセージ（ボタン選択待ち用） ---
 
 pending_messages = {}
 
-# --- tmux operations ---
+# --- tmux 操作 ---
 
 
 def tmux_list_sessions() -> list[str]:
-    """List running tmux sessions."""
+    """稼働中の tmux セッション一覧を取得"""
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name}"],
         capture_output=True, text=True,
@@ -119,7 +91,7 @@ def tmux_list_sessions() -> list[str]:
 
 
 def tmux_session_exists(session: str) -> bool:
-    """Check if a specific tmux session exists."""
+    """指定した tmux セッションが存在するか確認"""
     result = subprocess.run(
         ["tmux", "has-session", "-t", session],
         capture_output=True,
@@ -128,7 +100,7 @@ def tmux_session_exists(session: str) -> bool:
 
 
 def tmux_send(session: str, text: str) -> bool:
-    """Send text to a tmux session (types text + presses Enter)."""
+    """tmux セッションにテキストを送信"""
     if not tmux_session_exists(session):
         return False
     subprocess.run(
@@ -141,61 +113,25 @@ def tmux_send(session: str, text: str) -> bool:
 
 
 def tmux_capture(session: str) -> str:
-    """Capture current tmux pane content (last 50 lines)."""
+    """tmux セッションの現在の表示内容を取得（直近50行）"""
     if not tmux_session_exists(session):
-        return "(no session)"
+        return "(セッションなし)"
     result = subprocess.run(
         ["tmux", "capture-pane", "-t", session, "-p", "-l", "50"],
         capture_output=True, text=True,
     )
-    return result.stdout.strip() or "(empty)"
+    return result.stdout.strip() or "(空)"
 
 
-# --- Message parsing ---
+# --- メッセージ解析 ---
 
 
 def parse_mention(text: str) -> tuple[str | None, str]:
-    """Parse @session_name prefix. '@worker1 run tests' -> ('worker1', 'run tests')"""
+    """@セッション名 を解析。 '@worker1 テスト' → ('worker1', 'テスト')"""
     m = re.match(r"^@(\S+)\s+(.*)", text, re.DOTALL)
     if m:
         return m.group(1), m.group(2).strip()
     return None, text
-
-
-# --- Quick action: send y/n etc. with session auto-detection ---
-
-
-def quick_send_to_session(session: str, text: str, say):
-    """Quick action send with session auto-detection."""
-    if session:
-        send_to_session(session, text, say)
-    else:
-        sessions = tmux_list_sessions()
-        if len(sessions) == 0:
-            say(":x: No tmux sessions found.")
-        elif len(sessions) == 1:
-            send_to_session(sessions[0], text, say)
-        else:
-            # Multiple sessions -> button picker
-            msg_id = f"quick_{text}_{len(pending_messages)}"
-            pending_messages[msg_id] = text
-            buttons = [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": name},
-                    "action_id": f"send_to_{msg_id}_{name}",
-                    "value": json.dumps({"msg_id": msg_id, "session": name}),
-                }
-                for name in sessions
-            ]
-            blocks = [
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Select target for `{text}`:*"},
-                },
-                {"type": "actions", "elements": buttons},
-            ]
-            say(blocks=blocks, text="Select target")
 
 
 # --- Slack Bot ---
@@ -204,13 +140,13 @@ app = App(token=SLACK_BOT_TOKEN)
 
 
 def is_allowed(user_id: str) -> bool:
-    """Check if the user is authorized."""
+    """許可されたユーザーかチェック"""
     return user_id == SLACK_ALLOWED_USER
 
 
 @app.event("message")
 def handle_message(event, say):
-    """Handle DM messages."""
+    """DM メッセージを処理"""
     if event.get("bot_id") or event.get("subtype"):
         return
 
@@ -226,16 +162,16 @@ def handle_message(event, say):
         log.warning(f"Unauthorized user: {user}")
         return
 
-    # Strip optional cc: prefix
+    # cc: プレフィックス除去（オプション）
     prompt = text
     if text.lower().startswith("cc:"):
         prompt = text[3:].strip()
 
     if not prompt:
-        say("Message is empty. Please type an instruction.")
+        say("メッセージが空です。指示を入力してください。")
         return
 
-    # --- Special commands ---
+    # --- 特殊コマンド ---
     cmd = prompt.lower().strip()
 
     # status
@@ -246,37 +182,34 @@ def handle_message(event, say):
     # sessions / ls
     if cmd in ("sessions", "ls"):
         sessions = tmux_list_sessions()
-        if sessions:
-            lines = [f"  - `{s}`" for s in sessions]
-            say(f":computer: Active sessions ({len(sessions)}):\n" + "\n".join(lines))
-        else:
-            say(":x: No tmux sessions found. Start one with `tcc` on your Mac.")
+        if not sessions:
+            say(":x: tmux セッションが見つかりません。`tcc` で起動してください。")
+            return
+        lines = [f":computer: *セッション一覧 ({len(sessions)}個)*"]
+        for s in sessions:
+            lines.append(f"  • `{s}`")
+        say("\n".join(lines))
         return
 
-    # menu / m
-    if cmd in ("m", "menu"):
-        show_menu(say)
-        return
-
-    # --- @mention parsing ---
+    # --- @メンション解析 ---
     target_session, prompt = parse_mention(prompt)
 
     if target_session:
         send_to_session(target_session, prompt, say)
         return
 
-    # --- Session auto-detection ---
+    # --- セッション自動判定 ---
     sessions = tmux_list_sessions()
 
     if len(sessions) == 0:
-        say(":x: No tmux sessions found. Run `tcc` on your Mac first.")
+        say(":x: tmux セッションが見つかりません。Mac で `tcc` を実行してください。")
         return
 
     if len(sessions) == 1:
         send_to_session(sessions[0], prompt, say)
         return
 
-    # Multiple sessions -> button picker
+    # セッション複数 → ボタン選択
     msg_id = f"{user}_{event.get('ts', '')}"
     pending_messages[msg_id] = prompt
 
@@ -295,89 +228,17 @@ def handle_message(event, say):
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f":arrow_right: *Select target session:*\n> {prompt}",
+                "text": f":arrow_right: *送信先を選択してください:*\n> {prompt}",
             },
         },
         {"type": "actions", "elements": buttons},
     ]
 
-    say(blocks=blocks, text="Select target session")
-
-
-def show_menu(say):
-    """Show quick action menu with Block Kit buttons."""
-    sessions = tmux_list_sessions()
-
-    # Basic action buttons
-    quick_buttons = [
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "y (approve)"},
-            "action_id": "quick_y",
-            "style": "primary",
-        },
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "n (deny)"},
-            "action_id": "quick_n",
-            "style": "danger",
-        },
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "status"},
-            "action_id": "quick_status",
-        },
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "sessions"},
-            "action_id": "quick_sessions",
-        },
-    ]
-
-    blocks = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "*:zap: Quick Actions*"},
-        },
-        {"type": "actions", "elements": quick_buttons},
-    ]
-
-    # If multiple sessions, show per-session y/n/status buttons
-    if len(sessions) > 1:
-        for s in sessions:
-            session_buttons = [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "y"},
-                    "action_id": f"quick_session_y_{s}",
-                    "value": s,
-                    "style": "primary",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "n"},
-                    "action_id": f"quick_session_n_{s}",
-                    "value": s,
-                    "style": "danger",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "status"},
-                    "action_id": f"quick_session_status_{s}",
-                    "value": s,
-                },
-            ]
-            blocks.append({
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f":computer: *{s}*"},
-            })
-            blocks.append({"type": "actions", "elements": session_buttons})
-
-    say(blocks=blocks, text="Quick action menu")
+    say(blocks=blocks, text="送信先を選択してください")
 
 
 def handle_status(prompt: str, say):
-    """Handle status command."""
+    """status コマンド処理"""
     parts = prompt.split(maxsplit=1)
     sessions = tmux_list_sessions()
 
@@ -387,46 +248,47 @@ def handle_status(prompt: str, say):
             pane = tmux_capture(target)
             if len(pane) > 2500:
                 pane = "...\n" + pane[-2500:]
-            say(f":white_check_mark: `{target}` is running\n```\n{pane}\n```")
+            say(f":white_check_mark: `{target}` は稼働中\n```\n{pane}\n```")
         else:
-            say(f":x: `{target}` not found.")
+            say(f":x: `{target}` が見つかりません。")
         return
 
     if not sessions:
-        say(":x: No tmux sessions found. Start one with `tcc` on your Mac.")
+        say(":x: tmux セッションが見つかりません。`tcc` で起動してください。")
         return
 
     lines = []
     for s in sessions:
         pane = tmux_capture(s)
         last_lines = [l for l in pane.splitlines() if l.strip()]
-        last_line = last_lines[-1] if last_lines else "(empty)"
+        last_line = last_lines[-1] if last_lines else "(空)"
         if len(last_line) > 80:
             last_line = last_line[:80] + "..."
         lines.append(f":white_check_mark: `{s}`: {last_line}")
 
-    say(f":computer: Sessions ({len(sessions)}):\n" + "\n".join(lines))
+    say(f":computer: セッション一覧 ({len(sessions)}個):\n" + "\n".join(lines))
 
 
 def send_to_session(session: str, prompt: str, say):
-    """Send a message to the specified tmux session."""
+    """指定セッションにメッセージを送信"""
     if not tmux_session_exists(session):
-        say(f":x: `{session}` not found.")
+        say(f":x: `{session}` が見つかりません。")
         return
 
     if tmux_send(session, prompt):
         log.info(f"Sent to tmux:{session}: {prompt[:80]}")
-        say(f":arrow_right: Sent to `{session}`:\n> {prompt}")
+        say(f":arrow_right: `{session}` に送信しました:\n> {prompt}")
     else:
-        say(f":x: Failed to send to `{session}`.")
+        say(f":x: `{session}` への送信に失敗しました。")
 
 
-# --- Button handlers ---
+# --- ボタンハンドラ ---
 
-# Session selection buttons (when multiple sessions exist)
+
+# セッション選択ボタン（複数セッション時の送信先選択）
 @app.action(re.compile(r"send_to_.*"))
-def handle_session_select(ack, action, say, body):
-    """Handle session selection button press."""
+def handle_session_select(ack, action, respond, say, body):
+    """セッション選択ボタンが押された時の処理"""
     ack()
     user = body.get("user", {}).get("id", "")
     if not is_allowed(user):
@@ -435,7 +297,7 @@ def handle_session_select(ack, action, say, body):
     try:
         data = json.loads(action["value"])
     except (json.JSONDecodeError, KeyError):
-        say(":x: Error. Please send the message again.")
+        respond(text=":x: エラーが発生しました。もう一度送信してください。", replace_original=True)
         return
 
     msg_id = data.get("msg_id", "")
@@ -443,116 +305,46 @@ def handle_session_select(ack, action, say, body):
     prompt = pending_messages.pop(msg_id, None)
 
     if prompt is None:
-        say(":warning: Message expired. Please send it again.")
+        respond(text=":warning: メッセージの有効期限が切れました。", replace_original=True)
         return
 
-    send_to_session(session, prompt, say)
-
-
-# Quick action buttons (menu / notification y/n)
-@app.action("quick_y")
-def handle_quick_y(ack, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    quick_send_to_session("", "y", say)
-
-
-@app.action("quick_n")
-def handle_quick_n(ack, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    quick_send_to_session("", "n", say)
-
-
-@app.action("quick_status")
-def handle_quick_status(ack, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    handle_status("status", say)
-
-
-@app.action("quick_sessions")
-def handle_quick_sessions(ack, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    sessions = tmux_list_sessions()
-    if sessions:
-        lines = [f"  - `{s}`" for s in sessions]
-        say(f":computer: Active sessions ({len(sessions)}):\n" + "\n".join(lines))
+    if tmux_send(session, prompt):
+        log.info(f"Sent to tmux:{session}: {prompt[:80]}")
+        respond(text=f":arrow_right: `{session}` に送信: {prompt[:60]}", replace_original=True)
     else:
-        say(":x: No tmux sessions found.")
+        respond(text=f":x: `{session}` への送信に失敗", replace_original=True)
 
 
-@app.action("quick_menu")
-def handle_quick_menu(ack, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    show_menu(say)
-
-
-# Per-session quick actions (from menu when multiple sessions)
-@app.action(re.compile(r"quick_session_y_.*"))
-def handle_quick_session_y(ack, action, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    session = action.get("value", "")
-    send_to_session(session, "y", say)
-
-
-@app.action(re.compile(r"quick_session_n_.*"))
-def handle_quick_session_n(ack, action, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    session = action.get("value", "")
-    send_to_session(session, "n", say)
-
-
-@app.action(re.compile(r"quick_session_status_.*"))
-def handle_quick_session_status(ack, action, say, body):
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    session = action.get("value", "")
-    handle_status(f"status {session}", say)
-
-
-# Hook-triggered approve/deny buttons (from notification hook scripts)
+# 入力待ち通知からの許可/拒否ボタン（Hook スクリプトが送信）
 @app.action("hook_approve")
-def handle_hook_approve(ack, action, say, body):
+def handle_hook_approve(ack, action, respond, body):
     ack()
     if not is_allowed(body.get("user", {}).get("id", "")):
         return
     session = action.get("value", "") or DEFAULT_SESSION
     if tmux_send(session, "y"):
-        say(f":white_check_mark: Approved `{session}`")
+        respond(text=f":white_check_mark: `{session}` を許可しました", replace_original=True)
     else:
-        say(f":x: Failed to send to `{session}`")
+        respond(text=f":x: `{session}` への送信に失敗しました", replace_original=True)
 
 
 @app.action("hook_deny")
-def handle_hook_deny(ack, action, say, body):
+def handle_hook_deny(ack, action, respond, body):
     ack()
     if not is_allowed(body.get("user", {}).get("id", "")):
         return
     session = action.get("value", "") or DEFAULT_SESSION
     if tmux_send(session, "n"):
-        say(f":no_entry_sign: Denied `{session}`")
+        respond(text=f":no_entry_sign: `{session}` を拒否しました", replace_original=True)
     else:
-        say(f":x: Failed to send to `{session}`")
+        respond(text=f":x: `{session}` への送信に失敗しました", replace_original=True)
 
 
-# --- Entry point ---
+# --- 起動 ---
 
 
 def main():
-    log.info(f"Slack Bot starting... (default session: {DEFAULT_SESSION})")
+    log.info(f"Slack Bot 起動中... (default session: {DEFAULT_SESSION})")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
 
