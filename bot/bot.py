@@ -74,11 +74,14 @@ if not SLACK_ALLOWED_USER:
 
 # --- ログ設定 ---
 
+_log_dir = Path.home() / ".claude/slack-bot"
+_log_dir.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(Path.home() / ".claude/slack-bot/bot.log"),
+        logging.FileHandler(_log_dir / "bot.log"),
         logging.StreamHandler(),
     ],
 )
