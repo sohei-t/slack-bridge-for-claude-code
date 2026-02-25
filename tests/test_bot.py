@@ -58,11 +58,36 @@ def _patch_env(tmp_path: Any) -> Any:
     bot_mod.SLACK_ALLOWED_USER = original_allowed
 
 
-# We import after defining the fixture but the fixture is autouse,
-# so the module is already loaded. We handle re-import safely.
-with patch("bot.bot.ENV_FILE") as _mock_path:
-    _mock_path.exists.return_value = True
-    _mock_path.read_text.return_value = _ENV_FILE_CONTENT
+# We must patch Path methods before importing bot.bot, because
+# load_env() runs at module level and checks ENV_FILE.exists().
+from pathlib import Path
+
+_original_exists = Path.exists
+_original_read_text = Path.read_text
+
+
+def _patched_exists(self: Path) -> bool:
+    if "default.env" in str(self):
+        return True
+    return _original_exists(self)
+
+
+def _patched_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+    if "default.env" in str(self):
+        return _ENV_FILE_CONTENT
+    return _original_read_text(self, *args, **kwargs)
+
+
+_mock_auth_response = MagicMock()
+_mock_auth_response.data = {"ok": True, "user_id": "U_BOT", "bot_id": "B_BOT"}
+_mock_auth_response.__getitem__ = lambda self, key: self.data[key]
+_mock_auth_response.get = lambda key, default=None: _mock_auth_response.data.get(key, default)
+_mock_auth_response.status_code = 200
+_mock_auth_response.__bool__ = lambda self: True
+
+with patch.object(Path, "exists", _patched_exists), \
+     patch.object(Path, "read_text", _patched_read_text), \
+     patch("slack_sdk.web.client.WebClient.auth_test", return_value=_mock_auth_response):
     import bot.bot as bot_mod
 
 
