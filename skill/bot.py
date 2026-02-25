@@ -21,7 +21,6 @@ Slack DM で受け取ったメッセージを tmux 内の Claude Code に送信�
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import logging
