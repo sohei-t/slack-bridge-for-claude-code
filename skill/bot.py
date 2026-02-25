@@ -287,7 +287,7 @@ def handle_message(event: dict[str, Any], say: Say) -> None:
         for name in sessions
     ]
 
-    blocks = [
+    blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {
