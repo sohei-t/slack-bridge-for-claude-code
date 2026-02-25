@@ -3,7 +3,7 @@ name = "slack-bridge-for-claude-code"
 version = "1.0.0"
 description = "Bidirectional Slack integration for Claude Code"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 dependencies = [
     "slack-bolt>=1.18.0",
     "slack-sdk>=3.27.0",
@@ -16,6 +16,9 @@ dev = [
     "mypy>=1.8",
     "flake8>=7.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["bot*"]
 
 [tool.mypy]
 python_version = "3.10"
