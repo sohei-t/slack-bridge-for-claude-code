@@ -10,12 +10,11 @@ iPhone (Slack)  <->  Mac (bot.py)  <->  tmux  <->  Claude Code
 
 | Direction | Feature | Details |
 |-----------|---------|---------|
-| Mac -> Phone | Task completion notification | Includes tmux screen capture + quick action buttons |
+| Mac -> Phone | Task completion notification | Shows Claude's response summary + tmux screen capture |
 | Mac -> Phone | Permission prompt notification | Shows what Claude is asking + **Approve / Deny** buttons |
 | Phone -> Mac | Send instructions | Type in Slack DM -> delivered to Claude Code |
 | Phone -> Mac | Check status | `status` command shows current tmux screen |
-| Phone -> Mac | Multi-session support | `@session_name` mention, `sessions`/`ls`, session picker buttons |
-| Phone -> Mac | Quick action menu | `m`/`menu` shows one-tap buttons for common actions |
+| Phone -> Mac | Multi-session support | `@session_name` mention or auto session picker |
 
 ## Architecture
 
@@ -33,7 +32,7 @@ iPhone (Slack)  <->  Mac (bot.py)  <->  tmux  <->  Claude Code
 |  | Hook scripts|<-------------+|               |
 |  | (auto-fired |  Stop / Notification event    |
 |  |  by Claude) |--> Slack Bot DM               |
-|  +-------------+     (with Block Kit buttons)  |
+|  +-------------+                               |
 +------------------------------------------------+
          | Internet (Slack API, Socket Mode)
 +------------------+
@@ -46,6 +45,11 @@ iPhone (Slack)  <->  Mac (bot.py)  <->  tmux  <->  Claude Code
 
 ## Features
 
+### Notifications
+
+- **Task completion**: When Claude finishes, you get a notification with Claude's response summary and a tmux screen capture (no buttons -- just informational)
+- **Permission prompt**: When Claude needs approval, you get the prompt details with **Approve** and **Deny** buttons for one-tap response
+
 ### Multi-session support
 
 Run multiple Claude Code instances in separate tmux sessions and control them all from Slack:
@@ -53,28 +57,17 @@ Run multiple Claude Code instances in separate tmux sessions and control them al
 - **Auto-detection**: If only one session exists, messages are sent automatically
 - **Session picker**: If multiple sessions exist, Block Kit buttons let you choose the target
 - **Direct mention**: `@worker1 run tests` sends directly to the `worker1` session
-- **List sessions**: `sessions` or `ls` shows all active tmux sessions
-
-### Block Kit quick action buttons
-
-Interactive buttons appear directly in Slack notifications:
-
-- **Permission prompts**: `Approve (y)` / `Deny (n)` buttons -- one tap to respond
-- **Completion notifications**: `status` / `menu` buttons for quick follow-up
-- **Quick menu** (`m` or `menu`): Shows `y`, `n`, `status`, `sessions` buttons; with multiple sessions, per-session buttons are also shown
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
-| `<any text>` | Send instruction to Claude Code |
+| `<any text>` | Send instruction to Claude Code (auto-routed) |
 | `@session_name <text>` | Send to a specific tmux session |
 | `status` | Show all sessions with last output line |
 | `status <session>` | Show full screen capture of a specific session |
 | `sessions` / `ls` | List all active tmux sessions |
-| `m` / `menu` | Show quick action menu with buttons |
-| `y` | Approve (send "y" to Claude Code) |
-| `n` | Deny (send "n" to Claude Code) |
+| `y` / `n` | Approve or deny (auto-routed like any text) |
 | `cc: <text>` | Same as `<text>` (cc: prefix is optional) |
 
 ## Quick Start
@@ -167,11 +160,14 @@ Add to `~/.claude/settings.json`:
 ### 6. Start
 
 ```bash
-# Start tmux + Claude Code
-tmux new -s claude
-# Inside tmux, run: claude
+# Recommended: add tcc function to ~/.zshrc (auto-starts bot)
+tcc           # Creates tmux session + starts Claude Code + starts bot
 
-# In another terminal, start the bot
+# Or manually:
+tmux new -s claude
+# Inside tmux: claude
+
+# In another terminal:
 cd ~/.claude/slack-bot && nohup python3 bot.py >> bot.log 2>&1 &
 ```
 
@@ -180,26 +176,64 @@ cd ~/.claude/slack-bot && nohup python3 bot.py >> bot.log 2>&1 &
 Send a message to your bot's DM in Slack:
 - `status` -> See tmux screen content
 - `hello` -> Sends "hello" to Claude Code
-- `y` -> Approve a permission prompt
-- `m` -> Show quick action menu with buttons
 - `sessions` -> List all active tmux sessions
+
+## Auto bot startup with `tcc`
+
+Add this to your `~/.zshrc` to automatically start the Slack bot whenever you use `tcc`:
+
+```bash
+# Slack Bot auto-start (kill existing -> restart)
+_start_slack_bot() {
+  pkill -f "slack-bot/bot.py" 2>/dev/null
+  sleep 1
+  cd ~/.claude/slack-bot && nohup python3 bot.py >> bot.log 2>&1 &
+  cd - > /dev/null
+}
+
+# tmux + Claude Code + Slack Bot
+tcc() {
+  _start_slack_bot
+  local name="${1:-$(basename "$PWD")}"
+  name=$(echo "$name" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/^-\+//;s/-\+$//;s/-\{2,\}/-/g')
+  if [ -z "$name" ] || [ "${#name}" -le 1 ]; then
+    echo "Could not derive session name from: $(basename "$PWD")"
+    printf "Enter session name: "
+    read name
+    [ -z "$name" ] && echo "Cancelled" && return 1
+    name=$(echo "$name" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/^-\+//;s/-\+$//;s/-\{2,\}/-/g')
+  fi
+  if tmux has-session -t "$name" 2>/dev/null; then
+    tmux attach -t "$name"
+  else
+    tmux new-session -d -s "$name" -c "$PWD"
+    tmux send-keys -t "$name" "claude" Enter
+    tmux attach -t "$name"
+  fi
+}
+
+# Reattach to existing session (does NOT restart bot)
+atcc() {
+  local name="${1:-claude}"
+  tmux attach -t "$name" 2>/dev/null || echo "Session '$name' not found. Start with tcc."
+}
+```
+
+The bot is killed and restarted each time `tcc` runs. This is safe -- bot.py is completely independent from tmux sessions. Restarting it has zero impact on running Claude Code instances.
 
 ## Multi-session usage
 
 ```bash
 # Terminal 1: main session
 tcc claude
-# run claude inside
 
 # Terminal 2: worker session
 tcc worker1
-# run claude inside
 
 # From Slack:
-# "run tests" -> buttons appear to choose claude or worker1
+# "run tests" -> session picker buttons appear (choose claude or worker1)
 # "@worker1 run tests" -> sends directly to worker1
 # "status" -> shows both sessions
-# "m" -> shows per-session approve/deny/status buttons
 ```
 
 ## Agent Skill (optional)
@@ -220,37 +254,19 @@ Then use:
 - `/slack-bridge stop` - Stop the bot
 - `/slack-bridge status` - Check all components
 
-## tmux Tips
-
-```bash
-# Convenient alias (add to ~/.zshrc)
-tcc() {
-  local name="${1:-claude}"
-  if tmux has-session -t "$name" 2>/dev/null; then
-    tmux attach -t "$name"
-  else
-    tmux new -s "$name"
-  fi
-}
-
-# Usage
-tcc           # Create or attach to "claude" session
-tcc worker1   # Create or attach to "worker1" session
-```
-
 ## How It Works
 
-**bot.py** is a Python program that bridges two APIs:
+**bot.py** bridges two APIs:
 - **Slack API** (Socket Mode) - receives messages from your phone
 - **tmux CLI** (`send-keys` / `capture-pane`) - injects text into Claude Code
 
-When multiple tmux sessions are running, the bot auto-detects them and presents Block Kit buttons for session selection. You can also use `@session_name` to target a specific session directly.
+When multiple tmux sessions are running, the bot auto-detects them and presents session picker buttons. You can also use `@session_name` to target a specific session directly.
 
-**Hook scripts** are triggered automatically by Claude Code:
-- **Stop hook** -> fires when Claude finishes a task -> sends completion notification with `status` and `menu` buttons
-- **Notification hook** -> fires when Claude needs permission -> sends the prompt details with `Approve` and `Deny` buttons
+**Hook scripts** are triggered automatically by Claude Code events:
+- **Stop hook** (`slack-notify.sh`) -> fires when Claude finishes a task -> sends completion notification with Claude's response summary and tmux screen capture
+- **Notification hook** (`slack-notify-waiting.sh`) -> fires when Claude needs permission -> sends prompt details with **Approve** and **Deny** buttons
 
-The buttons use Slack's Block Kit interactive components. When you tap a button, the bot receives the action and sends the corresponding keystroke (`y` or `n`) to the correct tmux session.
+The Approve/Deny buttons use Slack's Block Kit interactive components. When you tap a button, the bot receives the action via Socket Mode and sends `y` or `n` to the correct tmux session. These are the **only** buttons in the system -- everything else is handled by typing text.
 
 tmux provides the critical capability that regular terminals lack: **external I/O access** via `send-keys` (inject input) and `capture-pane` (read screen output).
 
