@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Slack タスク完了通知スクリプト（Bot DM版）
 # Claude Code の Stop フックから呼び出され、タスク完了時に Bot DM に通知を送信する
 # tmux の画面内容も含めて送信する

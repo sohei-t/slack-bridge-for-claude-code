@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Slack 入力待ち通知スクリプト（Bot DM版）
 # Claude Code の Notification フックから呼び出され、承認待ち時に Bot DM に通知を送信する
 # tmux 画面キャプチャを含めて、何を問われているかを明確に伝える

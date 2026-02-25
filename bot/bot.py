@@ -18,26 +18,39 @@ Slack DM で受け取ったメッセージを tmux 内の Claude Code に送信�
   TMUX_SESSION_NAME=claude     # デフォルトセッション名 (default: claude)
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import subprocess
 import logging
 from pathlib import Path
+from typing import Any
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.context.ack import Ack
+from slack_bolt.context.respond import Respond
+from slack_bolt.context.say import Say
 
 # --- 設定読み込み ---
 
 ENV_FILE = Path.home() / ".config/ai-agents/profiles/default.env"
 
 
-def load_env():
-    """default.env から環境変数を読み込む"""
+def load_env() -> dict[str, str]:
+    """環境変数ファイルを読み込んでキーバリューの辞書として返す。
+
+    Returns:
+        環境変数名をキー、値をバリューとする辞書。
+
+    Raises:
+        FileNotFoundError: ENV_FILE が存在しない場合。
+    """
     if not ENV_FILE.exists():
         raise FileNotFoundError(f"{ENV_FILE} が見つかりません")
-    env = {}
+    env: dict[str, str] = {}
     for line in ENV_FILE.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
@@ -74,13 +87,17 @@ log = logging.getLogger(__name__)
 
 # --- 保留メッセージ（ボタン選択待ち用） ---
 
-pending_messages = {}
+pending_messages: dict[str, str] = {}
 
 # --- tmux 操作 ---
 
 
 def tmux_list_sessions() -> list[str]:
-    """稼働中の tmux セッション一覧を取得"""
+    """稼働中の tmux セッション名の一覧を取得する。
+
+    Returns:
+        セッション名の文字列リスト。tmux が起動していない場合は空リスト。
+    """
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name}"],
         capture_output=True, text=True,
@@ -91,7 +108,14 @@ def tmux_list_sessions() -> list[str]:
 
 
 def tmux_session_exists(session: str) -> bool:
-    """指定した tmux セッションが存在するか確認"""
+    """指定した tmux セッションが存在するか確認する。
+
+    Args:
+        session: 確認対象のセッション名。
+
+    Returns:
+        セッションが存在すれば True、なければ False。
+    """
     result = subprocess.run(
         ["tmux", "has-session", "-t", session],
         capture_output=True,
@@ -100,7 +124,15 @@ def tmux_session_exists(session: str) -> bool:
 
 
 def tmux_send(session: str, text: str) -> bool:
-    """tmux セッションにテキストを送信"""
+    """tmux セッションにテキストを送信して Enter キーを押す。
+
+    Args:
+        session: 送信先のセッション名。
+        text: 送信するテキスト。
+
+    Returns:
+        送信に成功すれば True、セッションが存在しなければ False。
+    """
     if not tmux_session_exists(session):
         return False
     subprocess.run(
@@ -113,7 +145,14 @@ def tmux_send(session: str, text: str) -> bool:
 
 
 def tmux_capture(session: str) -> str:
-    """tmux セッションの現在の表示内容を取得（直近50行）"""
+    """tmux セッションの現在の表示内容を取得する（直近50行）。
+
+    Args:
+        session: キャプチャ対象のセッション名。
+
+    Returns:
+        画面内容のテキスト。セッションが存在しない場合は "(セッションなし)"。
+    """
     if not tmux_session_exists(session):
         return "(セッションなし)"
     result = subprocess.run(
@@ -127,7 +166,17 @@ def tmux_capture(session: str) -> str:
 
 
 def parse_mention(text: str) -> tuple[str | None, str]:
-    """@セッション名 を解析。 '@worker1 テスト' → ('worker1', 'テスト')"""
+    """テキスト先頭の @セッション名 メンションを解析する。
+
+    '@worker1 テスト実行' のような入力から、セッション名とメッセージ本文を分離する。
+
+    Args:
+        text: 解析対象のテキスト。
+
+    Returns:
+        (セッション名, メッセージ本文) のタプル。
+        メンションがない場合は (None, 元のテキスト)。
+    """
     m = re.match(r"^@(\S+)\s+(.*)", text, re.DOTALL)
     if m:
         return m.group(1), m.group(2).strip()
@@ -140,13 +189,29 @@ app = App(token=SLACK_BOT_TOKEN)
 
 
 def is_allowed(user_id: str) -> bool:
-    """許可されたユーザーかチェック"""
+    """指定されたユーザーIDが許可リストに含まれるか確認する。
+
+    Args:
+        user_id: チェック対象の Slack ユーザーID。
+
+    Returns:
+        許可されたユーザーであれば True。
+    """
     return user_id == SLACK_ALLOWED_USER
 
 
 @app.event("message")
-def handle_message(event, say):
-    """DM メッセージを処理"""
+def handle_message(event: dict[str, Any], say: Say) -> None:
+    """Slack DM メッセージを受信して適切なハンドラにルーティングする。
+
+    ボットメッセージやサブタイプ付きイベントは無視する。
+    特殊コマンド（status, sessions, ls）はそれぞれ専用のハンドラへ、
+    通常メッセージは tmux セッションへの送信処理に渡す。
+
+    Args:
+        event: Slack イベントペイロード。
+        say: Slack にメッセージを送信する関数。
+    """
     if event.get("bot_id") or event.get("subtype"):
         return
 
@@ -237,8 +302,16 @@ def handle_message(event, say):
     say(blocks=blocks, text="送信先を選択してください")
 
 
-def handle_status(prompt: str, say):
-    """status コマンド処理"""
+def handle_status(prompt: str, say: Say) -> None:
+    """status コマンドを処理して、セッションの状態を Slack に返す。
+
+    'status' のみの場合は全セッションの概要を表示し、
+    'status <session>' の場合は指定セッションの画面キャプチャを表示する。
+
+    Args:
+        prompt: ユーザーが入力したコマンド文字列。
+        say: Slack にメッセージを送信する関数。
+    """
     parts = prompt.split(maxsplit=1)
     sessions = tmux_list_sessions()
 
@@ -260,7 +333,7 @@ def handle_status(prompt: str, say):
     lines = []
     for s in sessions:
         pane = tmux_capture(s)
-        last_lines = [l for l in pane.splitlines() if l.strip()]
+        last_lines = [line for line in pane.splitlines() if line.strip()]
         last_line = last_lines[-1] if last_lines else "(空)"
         if len(last_line) > 80:
             last_line = last_line[:80] + "..."
@@ -269,8 +342,14 @@ def handle_status(prompt: str, say):
     say(f":computer: セッション一覧 ({len(sessions)}個):\n" + "\n".join(lines))
 
 
-def send_to_session(session: str, prompt: str, say):
-    """指定セッションにメッセージを送信"""
+def send_to_session(session: str, prompt: str, say: Say) -> None:
+    """指定された tmux セッションにメッセージを送信し、結果を Slack に通知する。
+
+    Args:
+        session: 送信先のセッション名。
+        prompt: 送信するメッセージ。
+        say: Slack にメッセージを送信する関数。
+    """
     if not tmux_session_exists(session):
         say(f":x: `{session}` が見つかりません。")
         return
@@ -287,8 +366,25 @@ def send_to_session(session: str, prompt: str, say):
 
 # セッション選択ボタン（複数セッション時の送信先選択）
 @app.action(re.compile(r"send_to_.*"))
-def handle_session_select(ack, action, respond, say, body):
-    """セッション選択ボタンが押された時の処理"""
+def handle_session_select(
+    ack: Ack,
+    action: dict[str, Any],
+    respond: Respond,
+    say: Say,
+    body: dict[str, Any],
+) -> None:
+    """複数セッション時にユーザーが選択したセッションにメッセージを送信する。
+
+    ボタンの value に含まれる msg_id から保留メッセージを取得し、
+    選択されたセッションに送信する。
+
+    Args:
+        ack: リクエスト確認応答関数。
+        action: アクションペイロード。
+        respond: 元メッセージを更新するための応答関数。
+        say: Slack にメッセージを送信する関数。
+        body: リクエストボディ全体。
+    """
     ack()
     user = body.get("user", {}).get("id", "")
     if not is_allowed(user):
@@ -317,7 +413,20 @@ def handle_session_select(ack, action, respond, say, body):
 
 # 入力待ち通知からの許可/拒否ボタン（Hook スクリプトが送信）
 @app.action("hook_approve")
-def handle_hook_approve(ack, action, respond, body):
+def handle_hook_approve(
+    ack: Ack,
+    action: dict[str, Any],
+    respond: Respond,
+    body: dict[str, Any],
+) -> None:
+    """入力待ち通知の許可ボタンが押された時に 'y' を tmux セッションに送信する。
+
+    Args:
+        ack: リクエスト確認応答関数。
+        action: アクションペイロード（value にセッション名を含む）。
+        respond: 元メッセージを更新するための応答関数。
+        body: リクエストボディ全体。
+    """
     ack()
     if not is_allowed(body.get("user", {}).get("id", "")):
         return
@@ -329,7 +438,20 @@ def handle_hook_approve(ack, action, respond, body):
 
 
 @app.action("hook_deny")
-def handle_hook_deny(ack, action, respond, body):
+def handle_hook_deny(
+    ack: Ack,
+    action: dict[str, Any],
+    respond: Respond,
+    body: dict[str, Any],
+) -> None:
+    """入力待ち通知の拒否ボタンが押された時に 'n' を tmux セッションに送信する。
+
+    Args:
+        ack: リクエスト確認応答関数。
+        action: アクションペイロード（value にセッション名を含む）。
+        respond: 元メッセージを更新するための応答関数。
+        body: リクエストボディ全体。
+    """
     ack()
     if not is_allowed(body.get("user", {}).get("id", "")):
         return
@@ -343,7 +465,8 @@ def handle_hook_deny(ack, action, respond, body):
 # --- 起動 ---
 
 
-def main():
+def main() -> None:
+    """Slack Bot を Socket Mode で起動する。"""
     log.info(f"Slack Bot 起動中... (default session: {DEFAULT_SESSION})")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()

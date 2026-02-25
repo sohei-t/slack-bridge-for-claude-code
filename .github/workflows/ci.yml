@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r bot/requirements.txt
+          pip install -e ".[dev]"
 
       - name: Run flake8 linting
         run: flake8 bot/ hooks/ skill/ --max-line-length=120
@@ -30,9 +30,4 @@ jobs:
         run: mypy bot/ --ignore-missing-imports
 
       - name: Run pytest
-        run: |
-          if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
-            pytest
-          else
-            echo "No tests found, skipping pytest"
-          fi
+        run: pytest tests/ -v
