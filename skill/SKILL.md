@@ -1,12 +1,12 @@
 ---
 name: slack-bridge
-description: Bidirectional bridge between Slack and Claude Code. Sends task completion and permission prompt notifications to Slack Bot DM, and accepts instructions from Slack. Works via tmux. Supports setup/start/stop/status commands.
+description: Bidirectional bridge between Slack and Claude Code. Sends task completion and permission prompt notifications to Slack Bot DM, and accepts instructions from Slack. Works via tmux. Supports multi-session, Block Kit quick actions, and setup/start/stop/status commands.
 argument-hint: "[setup|start|stop|status]"
 ---
 
 # Slack Bridge - Bidirectional Slack + Claude Code Integration
 
-Control Claude Code from your phone via Slack Bot DM.
+Control Claude Code from your phone via Slack Bot DM. Supports multiple tmux sessions and Block Kit quick action buttons.
 
 ## Commands
 
@@ -29,14 +29,14 @@ which tmux || echo "tmux required: brew install tmux"
 
 Walk the user through:
 
-1. https://api.slack.com/apps → Create New App → From scratch
+1. https://api.slack.com/apps -> Create New App -> From scratch
 2. App name: `Claude Code Bridge`
-3. Enable **Socket Mode** → Generate App-Level Token (`connections:write` scope) → note the `xapp-` token
-4. **OAuth & Permissions** → Add Bot Token Scopes:
+3. Enable **Socket Mode** -> Generate App-Level Token (`connections:write` scope) -> note the `xapp-` token
+4. **OAuth & Permissions** -> Add Bot Token Scopes:
    - `chat:write`, `im:history`, `im:write`, `users:read`
-5. **Event Subscriptions** → Enable → Add Bot Event: `message.im`
-6. Install to workspace → note the `xoxb-` Bot User OAuth Token
-7. Find your Slack User ID (Profile → ... → Copy member ID)
+5. **Event Subscriptions** -> Enable -> Add Bot Event: `message.im`
+6. Install to workspace -> note the `xoxb-` Bot User OAuth Token
+7. Find your Slack User ID (Profile -> ... -> Copy member ID)
 
 #### 3. Set environment variables
 
@@ -50,36 +50,64 @@ SLACK_ALLOWED_USER=U...
 TMUX_SESSION_NAME=claude
 ```
 
-#### 4. Deploy files
+#### 4. Deploy bot file
 
 ```bash
-mkdir -p ~/.claude/slack-bot ~/.claude/hooks
-cp ~/.claude/skills/slack-bridge/../bot/bot.py ~/.claude/slack-bot/bot.py
-cp ~/.claude/skills/slack-bridge/../hooks/slack-notify.sh ~/.claude/hooks/
-cp ~/.claude/skills/slack-bridge/../hooks/slack-notify-waiting.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/slack-notify*.sh
+mkdir -p ~/.claude/slack-bot
+cp ~/.claude/skills/slack-bridge/bot.py ~/.claude/slack-bot/bot.py
 ```
 
-If the skill was installed standalone (not from the full repo), copy from the repo clone instead.
+#### 5. Deploy hook scripts
 
-#### 5. Configure Claude Code hooks
+```bash
+mkdir -p ~/.claude/hooks
+cp ~/.claude/skills/slack-bridge/hooks/slack-notify.sh ~/.claude/hooks/slack-notify.sh
+cp ~/.claude/skills/slack-bridge/hooks/slack-notify-waiting.sh ~/.claude/hooks/slack-notify-waiting.sh
+chmod +x ~/.claude/hooks/slack-notify.sh
+chmod +x ~/.claude/hooks/slack-notify-waiting.sh
+```
+
+#### 6. Configure Claude Code hooks
 
 Add to `~/.claude/settings.json` hooks section (merge with existing, don't overwrite):
 
 ```json
 {
   "hooks": {
-    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "bash ~/.claude/hooks/slack-notify.sh"}]}],
-    "Notification": [{"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "bash ~/.claude/hooks/slack-notify-waiting.sh"}]}]
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/slack-notify.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/slack-notify-waiting.sh"
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
-#### 6. Add tmux aliases to shell
+**Important**: If there are existing hooks, add to the arrays. Don't overwrite.
+
+#### 7. Add tmux aliases to shell
 
 Add to `~/.zshrc` or `~/.bashrc`:
 
 ```bash
+# tmux + Claude Code
 tcc() {
   local name="${1:-claude}"
   if tmux has-session -t "$name" 2>/dev/null; then
@@ -88,9 +116,13 @@ tcc() {
     tmux new -s "$name"
   fi
 }
+atcc() {
+  local name="${1:-claude}"
+  tmux attach -t "$name" 2>/dev/null || echo "Session '$name' not found. Start with tcc."
+}
 ```
 
-#### 7. Verify
+#### 8. Verify
 
 ```bash
 cd ~/.claude/slack-bot && python3 bot.py &
@@ -100,6 +132,12 @@ curl -s -X POST "https://slack.com/api/auth.test" \
   -H "Content-Type: application/json; charset=utf-8" \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print('Connected' if d.get('ok') else f'Error: {d.get(\"error\")}')"
 ```
+
+After setup, let the user know:
+- `tcc` starts tmux + Claude Code
+- `tcc worker1` creates a named session for multi-session use
+- Slack Bot DM accepts instructions
+- Task completion and permission prompts trigger Slack notifications with action buttons
 
 ---
 
@@ -133,8 +171,8 @@ fi
 
 ```bash
 echo "=== Slack Bridge Status ==="
-pgrep -f "slack-bot/bot.py" > /dev/null && echo "Bot: running" || echo "Bot: stopped"
-tmux has-session -t "${TMUX_SESSION_NAME:-claude}" 2>/dev/null && echo "tmux: running" || echo "tmux: not found"
+pgrep -f "slack-bot/bot.py" > /dev/null && echo "Bot: running (PID: $(pgrep -f 'slack-bot/bot.py' | head -1))" || echo "Bot: stopped"
+tmux list-sessions 2>/dev/null && echo "tmux: running" || echo "tmux: not found"
 [ -f ~/.claude/hooks/slack-notify.sh ] && echo "Hook (completion): installed" || echo "Hook (completion): missing"
 [ -f ~/.claude/hooks/slack-notify-waiting.sh ] && echo "Hook (waiting): installed" || echo "Hook (waiting): missing"
 ```
@@ -153,4 +191,11 @@ Usage:
   /slack-bridge start   - Start bot
   /slack-bridge stop    - Stop bot
   /slack-bridge status  - Check status
+
+Features:
+  - Task completion notifications with tmux screen capture
+  - Permission prompt notifications with approve/deny buttons
+  - Send instructions from Slack DM to Claude Code
+  - Multi-session support (@session_name, sessions/ls, menu)
+  - Block Kit quick action buttons for one-tap approve/deny
 ```
