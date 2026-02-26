@@ -412,6 +412,28 @@ class TestHandleMessageAuthorized:
         call_kwargs = mock_say.call_args[1]
         assert "blocks" in call_kwargs
 
+    @patch("bot.bot.tmux_list_sessions", return_value=["claude", "worker1"])
+    def test_button_value_contains_prompt(
+        self,
+        mock_list: MagicMock,
+        mock_say: MagicMock,
+    ) -> None:
+        """Button value should embed the prompt directly (no pending_messages)."""
+        event = {
+            "user": "U_ALLOWED",
+            "text": "テスト実行して",
+            "channel_type": "im",
+            "ts": "1234567890.123456",
+        }
+        bot_mod.handle_message(event, mock_say)
+        blocks = mock_say.call_args[1]["blocks"]
+        actions = blocks[1]["elements"]
+        for btn in actions:
+            data = json.loads(btn["value"])
+            assert "prompt" in data
+            assert data["prompt"] == "テスト実行して"
+            assert "session" in data
+
     @patch("bot.bot.tmux_list_sessions", return_value=["s1"])
     def test_sessions_command(
         self,
