@@ -21,6 +21,9 @@ Slack DM で受け取ったメッセージを tmux 内の Claude Code に送信�
 from __future__ import annotations
 
 import json
+import os
+import signal
+import sys
 import re
 import subprocess
 import logging
@@ -86,10 +89,6 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
-
-# --- 保留メッセージ（ボタン選択待ち用） ---
-
-pending_messages: dict[str, str] = {}
 
 # --- tmux 操作 ---
 
@@ -277,15 +276,15 @@ def handle_message(event: dict[str, Any], say: Say) -> None:
         return
 
     # セッション複数 → ボタン選択
-    msg_id = f"{user}_{event.get('ts', '')}"
-    pending_messages[msg_id] = prompt
+    # Slack button value の上限は 2000 文字。prompt を直接埋め込む。
+    prompt_for_btn = prompt[:1900]
 
     buttons = [
         {
             "type": "button",
             "text": {"type": "plain_text", "text": f":computer: {name}"},
-            "action_id": f"send_to_{msg_id}_{name}",
-            "value": json.dumps({"msg_id": msg_id, "session": name}),
+            "action_id": f"send_to_{name}",
+            "value": json.dumps({"session": name, "prompt": prompt_for_btn}),
         }
         for name in sessions
     ]
@@ -377,8 +376,8 @@ def handle_session_select(
 ) -> None:
     """複数セッション時にユーザーが選択したセッションにメッセージを送信する。
 
-    ボタンの value に含まれる msg_id から保留メッセージを取得し、
-    選択されたセッションに送信する。
+    ボタンの value にメッセージ本文が埋め込まれているため、
+    Bot 再起動やコネクション切断の影響を受けない。
 
     Args:
         ack: リクエスト確認応答関数。
@@ -398,12 +397,11 @@ def handle_session_select(
         respond(text=":x: エラーが発生しました。もう一度送信してください。", replace_original=True)
         return
 
-    msg_id = data.get("msg_id", "")
     session = data.get("session", "")
-    prompt = pending_messages.pop(msg_id, None)
+    prompt = data.get("prompt", "")
 
-    if prompt is None:
-        respond(text=":warning: メッセージの有効期限が切れました。", replace_original=True)
+    if not prompt:
+        respond(text=":warning: メッセージが空です。もう一度送信してください。", replace_original=True)
         return
 
     if tmux_send(session, prompt):
@@ -464,14 +462,46 @@ def handle_hook_deny(
         respond(text=f":x: `{session}` への送信に失敗しました", replace_original=True)
 
 
+# --- PID ファイルによる多重起動防止 ---
+
+PID_FILE = _log_dir / "bot.pid"
+
+
+def _kill_existing() -> None:
+    """既存の Bot プロセスを PID ファイルから特定して停止する。"""
+    if not PID_FILE.exists():
+        return
+    try:
+        old_pid = int(PID_FILE.read_text().strip())
+        os.kill(old_pid, signal.SIGTERM)
+        log.info(f"既存プロセス (PID {old_pid}) を停止しました")
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    PID_FILE.unlink(missing_ok=True)
+
+
+def _cleanup(_sig: int = 0, _frame: Any = None) -> None:
+    """終了時に PID ファイルを削除する。"""
+    PID_FILE.unlink(missing_ok=True)
+    sys.exit(0)
+
+
 # --- 起動 ---
 
 
 def main() -> None:
     """Slack Bot を Socket Mode で起動する。"""
-    log.info(f"Slack Bot 起動中... (default session: {DEFAULT_SESSION})")
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    handler.start()
+    _kill_existing()
+    PID_FILE.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+
+    log.info(f"Slack Bot 起動中... (PID {os.getpid()}, default session: {DEFAULT_SESSION})")
+    try:
+        handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+        handler.start()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
