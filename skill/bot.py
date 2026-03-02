@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-Slack → Claude Code ブリッジ Bot（マルチセッション対応）
-Slack DM で受け取ったメッセージを tmux 内の Claude Code に送信する
+Slack -> Claude Code Bridge Bot (Multi-session Support)
 
-使い方:
-  Slack DM で:
-    テスト実行して              → セッション1つなら自動送信、複数ならボタン選択
-    @worker1 テスト実行して     → 直接 worker1 セッションに送信
-    status                     → 全セッションの状態を確認
-    status claude              → 特定セッションの画面を確認
-    sessions / ls              → セッション一覧
+Receives messages via Slack DM and forwards them to Claude Code
+running inside tmux sessions.
 
-環境変数 (~/.config/ai-agents/profiles/default.env):
-  SLACK_BOT_TOKEN=xoxb-...     # Bot User OAuth Token
-  SLACK_APP_TOKEN=xapp-...     # App-Level Token (Socket Mode用)
-  SLACK_ALLOWED_USER=U...      # 許可するSlackユーザーID（自分のみ）
-  TMUX_SESSION_NAME=claude     # デフォルトセッション名 (default: claude)
+Usage (Slack DM):
+    Run tests                  -> Auto-send if 1 session, button select if multiple
+    @worker1 Run tests         -> Send directly to worker1 session
+    status                     -> Check status of all sessions
+    status claude              -> Check status of specific session
+    sessions / ls              -> List all sessions
+
+Environment variables (~/.config/ai-agents/profiles/default.env):
+    SLACK_BOT_TOKEN=xoxb-...     # Bot User OAuth Token
+    SLACK_APP_TOKEN=xapp-...     # App-Level Token (for Socket Mode)
+    SLACK_ALLOWED_USER=U...      # Allowed Slack user ID (self only)
+    TMUX_SESSION_NAME=claude     # Default session name (default: claude)
+
+Architecture:
+    Config         - Environment variable loading and validation
+    TmuxManager    - Tmux session operations (list, send, capture)
+    MessageRouter  - Message parsing and command routing
+    SlackBot       - Main orchestrator with Slack event/action handlers
 """
 
 from __future__ import annotations
@@ -36,472 +43,850 @@ from slack_bolt.context.ack import Ack
 from slack_bolt.context.respond import Respond
 from slack_bolt.context.say import Say
 
-# --- 設定読み込み ---
 
-ENV_FILE = Path.home() / ".config/ai-agents/profiles/default.env"
+# ===================================================================
+# Config
+# ===================================================================
 
 
-def load_env() -> dict[str, str]:
-    """環境変数ファイルを読み込んでキーバリューの辞書として返す。
+class Config:
+    """Application configuration loaded from an environment file.
 
-    Returns:
-        環境変数名をキー、値をバリューとする辞書。
+    Reads key-value pairs from the env file, validates that all required
+    Slack credentials are present, and configures the logging subsystem.
 
-    Raises:
-        FileNotFoundError: ENV_FILE が存在しない場合。
+    Attributes:
+        ENV_FILE: Path to the environment variable file.
+        SLACK_BOT_TOKEN: Bot User OAuth token for Slack API calls.
+        SLACK_APP_TOKEN: App-Level token for Socket Mode connections.
+        SLACK_ALLOWED_USER: Slack user ID allowed to interact with the bot.
+        DEFAULT_SESSION: Default tmux session name.
+        LOG_DIR: Directory for log files.
+        PID_FILE: Path to the PID file for duplicate-process prevention.
+        LOG_FORMAT: Format string for log messages.
+        PANE_CAPTURE_LIMIT: Maximum number of lines to capture from tmux.
+        BUTTON_VALUE_MAX_LENGTH: Maximum character length for Slack button values.
+        STATUS_PANE_MAX_LENGTH: Maximum character length for status pane output.
+        STATUS_LINE_MAX_LENGTH: Maximum character length for a single status line.
     """
-    if not ENV_FILE.exists():
-        raise FileNotFoundError(f"{ENV_FILE} が見つかりません")
-    env: dict[str, str] = {}
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            env[key.strip()] = value.strip()
-    return env
+
+    ENV_FILE: Path = Path.home() / ".config/ai-agents/profiles/default.env"
+    LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(message)s"
+    PANE_CAPTURE_LIMIT: int = 50
+    BUTTON_VALUE_MAX_LENGTH: int = 1900
+    STATUS_PANE_MAX_LENGTH: int = 2500
+    STATUS_LINE_MAX_LENGTH: int = 80
+
+    def __init__(self, env_file: Path | None = None) -> None:
+        """Initialize configuration by loading and validating environment variables.
+
+        Args:
+            env_file: Optional override for the environment file path.
+                      Defaults to ``~/.config/ai-agents/profiles/default.env``.
+
+        Raises:
+            FileNotFoundError: If the env file does not exist.
+            ValueError: If any required environment variable is missing.
+        """
+        if env_file is not None:
+            self.ENV_FILE = env_file
+
+        env = self._load_env()
+
+        self.SLACK_BOT_TOKEN: str = env.get("SLACK_BOT_TOKEN", "")
+        self.SLACK_APP_TOKEN: str = env.get("SLACK_APP_TOKEN", "")
+        self.SLACK_ALLOWED_USER: str = env.get("SLACK_ALLOWED_USER", "")
+        self.DEFAULT_SESSION: str = env.get("TMUX_SESSION_NAME", "claude")
+
+        self._validate()
+
+        self.LOG_DIR: Path = Path.home() / ".claude/slack-bot"
+        self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.PID_FILE: Path = self.LOG_DIR / "bot.pid"
+
+        self._configure_logging()
+
+    def _load_env(self) -> dict[str, str]:
+        """Read the environment file and return a key-value dictionary.
+
+        Returns:
+            A dictionary mapping variable names to their string values.
+
+        Raises:
+            FileNotFoundError: If ``self.ENV_FILE`` does not exist.
+        """
+        if not self.ENV_FILE.exists():
+            raise FileNotFoundError(f"{self.ENV_FILE} が見つかりません")
+        env: dict[str, str] = {}
+        for line in self.ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip()
+        return env
+
+    def _validate(self) -> None:
+        """Validate that all required environment variables are set.
+
+        Raises:
+            ValueError: If any required variable is empty or missing.
+        """
+        if not self.SLACK_BOT_TOKEN:
+            raise ValueError("SLACK_BOT_TOKEN が未設定です")
+        if not self.SLACK_APP_TOKEN:
+            raise ValueError("SLACK_APP_TOKEN が未設定です")
+        if not self.SLACK_ALLOWED_USER:
+            raise ValueError("SLACK_ALLOWED_USER が未設定です（セキュリティのため必須）")
+
+    def _configure_logging(self) -> None:
+        """Set up file and console logging handlers."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format=self.LOG_FORMAT,
+            handlers=[
+                logging.FileHandler(self.LOG_DIR / "bot.log"),
+                logging.StreamHandler(),
+            ],
+        )
 
 
-env = load_env()
-
-SLACK_BOT_TOKEN = env.get("SLACK_BOT_TOKEN", "")
-SLACK_APP_TOKEN = env.get("SLACK_APP_TOKEN", "")
-SLACK_ALLOWED_USER = env.get("SLACK_ALLOWED_USER", "")
-DEFAULT_SESSION = env.get("TMUX_SESSION_NAME", "claude")
-
-if not SLACK_BOT_TOKEN:
-    raise ValueError("SLACK_BOT_TOKEN が未設定です")
-if not SLACK_APP_TOKEN:
-    raise ValueError("SLACK_APP_TOKEN が未設定です")
-if not SLACK_ALLOWED_USER:
-    raise ValueError("SLACK_ALLOWED_USER が未設定です（セキュリティのため必須）")
-
-# --- ログ設定 ---
-
-_log_dir = Path.home() / ".claude/slack-bot"
-_log_dir.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(_log_dir / "bot.log"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger(__name__)
-
-# --- tmux 操作 ---
+# ===================================================================
+# TmuxManager
+# ===================================================================
 
 
-def tmux_list_sessions() -> list[str]:
-    """稼働中の tmux セッション名の一覧を取得する。
+class TmuxManager:
+    """Manages interactions with tmux sessions.
 
-    Returns:
-        セッション名の文字列リスト。tmux が起動していない場合は空リスト。
+    Provides methods to list, verify, send text to, and capture output
+    from tmux sessions via subprocess calls.
+
+    Attributes:
+        capture_lines: Number of lines to capture from the tmux pane.
     """
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return []
-    return [s.strip() for s in result.stdout.splitlines() if s.strip()]
+
+    def __init__(self, capture_lines: int = 50) -> None:
+        """Initialize the TmuxManager.
+
+        Args:
+            capture_lines: Number of lines to capture from the pane
+                           (default: 50).
+        """
+        self.capture_lines: int = capture_lines
+
+    def list_sessions(self) -> list[str]:
+        """Return a list of running tmux session names.
+
+        Returns:
+            A list of session name strings. Returns an empty list if
+            tmux is not running.
+        """
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return []
+        return [s.strip() for s in result.stdout.splitlines() if s.strip()]
+
+    def session_exists(self, name: str) -> bool:
+        """Check whether a tmux session with the given name exists.
+
+        Args:
+            name: The session name to check.
+
+        Returns:
+            True if the session exists, False otherwise.
+        """
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", name],
+            capture_output=True,
+        )
+        return result.returncode == 0
+
+    def send(self, session: str, text: str) -> bool:
+        """Send text to a tmux session followed by an Enter keystroke.
+
+        Args:
+            session: The target session name.
+            text: The text to send.
+
+        Returns:
+            True if the text was sent successfully, False if the
+            session does not exist.
+        """
+        if not self.session_exists(session):
+            return False
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session, "-l", text],
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session, "Enter"],
+        )
+        return True
+
+    def capture(self, session: str, lines: int | None = None) -> str:
+        """Capture the current pane content of a tmux session.
+
+        Args:
+            session: The session name to capture.
+            lines: Number of lines to capture. Defaults to
+                   ``self.capture_lines``.
+
+        Returns:
+            The captured pane text. Returns ``"(セッションなし)"`` if
+            the session does not exist, or ``"(空)"`` if the pane is empty.
+        """
+        if not self.session_exists(session):
+            return "(セッションなし)"
+        capture_count = lines if lines is not None else self.capture_lines
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session, "-p", "-l", str(capture_count)],
+            capture_output=True, text=True,
+        )
+        return result.stdout.strip() or "(空)"
 
 
-def tmux_session_exists(session: str) -> bool:
-    """指定した tmux セッションが存在するか確認する。
+# ===================================================================
+# MessageRouter
+# ===================================================================
 
-    Args:
-        session: 確認対象のセッション名。
 
-    Returns:
-        セッションが存在すれば True、なければ False。
+class MessageRouter:
+    """Parses and classifies incoming Slack messages.
+
+    Determines whether a message is a special command (status, sessions/ls),
+    a mention-targeted message, or a regular prompt, and provides the
+    parsed result.
+
+    Attributes:
+        COMMAND_SESSIONS: Set of command strings that trigger session listing.
+        COMMAND_STATUS: The command prefix for status queries.
+        CC_PREFIX: Optional prefix that is stripped from messages.
     """
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", session],
-        capture_output=True,
-    )
-    return result.returncode == 0
+
+    COMMAND_SESSIONS: frozenset[str] = frozenset({"sessions", "ls"})
+    COMMAND_STATUS: str = "status"
+    CC_PREFIX: str = "cc:"
+
+    _MENTION_RE: re.Pattern[str] = re.compile(r"^@(\S+)\s+(.*)", re.DOTALL)
+
+    def parse_mention(self, text: str) -> tuple[str | None, str]:
+        """Extract a leading ``@session`` mention from the text.
+
+        Parses inputs like ``'@worker1 run tests'`` into a session name
+        and the remaining message body.
+
+        Args:
+            text: The raw message text.
+
+        Returns:
+            A tuple of ``(session_name, message_body)``. If no mention
+            is found, returns ``(None, original_text)``.
+        """
+        m = self._MENTION_RE.match(text)
+        if m:
+            return m.group(1), m.group(2).strip()
+        return None, text
+
+    def strip_cc_prefix(self, text: str) -> str:
+        """Remove the optional ``cc:`` prefix from a message.
+
+        Args:
+            text: The raw message text.
+
+        Returns:
+            The text with the ``cc:`` prefix removed and stripped, or the
+            original text if the prefix is not present.
+        """
+        if text.lower().startswith(self.CC_PREFIX):
+            return text[len(self.CC_PREFIX):].strip()
+        return text
+
+    def is_status_command(self, text: str) -> bool:
+        """Check whether the text is a status command.
+
+        Args:
+            text: The lowercased, stripped message text.
+
+        Returns:
+            True if the text starts with ``'status'``.
+        """
+        return text.lower().strip().startswith(self.COMMAND_STATUS)
+
+    def is_sessions_command(self, text: str) -> bool:
+        """Check whether the text is a session-listing command.
+
+        Args:
+            text: The lowercased, stripped message text.
+
+        Returns:
+            True if the text matches ``'sessions'`` or ``'ls'``.
+        """
+        return text.lower().strip() in self.COMMAND_SESSIONS
+
+    def is_valid_command(self, text: str) -> bool:
+        """Check whether the text is any recognized special command.
+
+        Args:
+            text: The message text to check.
+
+        Returns:
+            True if the text is a status or sessions command.
+        """
+        return self.is_status_command(text) or self.is_sessions_command(text)
 
 
-def tmux_send(session: str, text: str) -> bool:
-    """tmux セッションにテキストを送信して Enter キーを押す。
+# ===================================================================
+# SlackBot
+# ===================================================================
 
-    Args:
-        session: 送信先のセッション名。
-        text: 送信するテキスト。
 
-    Returns:
-        送信に成功すれば True、セッションが存在しなければ False。
+class SlackBot:
+    """Main Slack Bot orchestrator.
+
+    Initializes the Slack Bolt application, registers event and action
+    handlers, and manages the bot lifecycle (PID file, signal handling,
+    Socket Mode startup).
+
+    Attributes:
+        config: The application configuration.
+        tmux: The tmux session manager.
+        router: The message parser and router.
+        app: The Slack Bolt ``App`` instance.
+        log: The logger for this bot instance.
     """
-    if not tmux_session_exists(session):
-        return False
-    subprocess.run(
-        ["tmux", "send-keys", "-t", session, "-l", text],
-    )
-    subprocess.run(
-        ["tmux", "send-keys", "-t", session, "Enter"],
-    )
-    return True
 
+    def __init__(self, config: Config) -> None:
+        """Initialize the SlackBot with the given configuration.
 
-def tmux_capture(session: str) -> str:
-    """tmux セッションの現在の表示内容を取得する（直近50行）。
+        Args:
+            config: A ``Config`` instance with validated settings.
+        """
+        self.config: Config = config
+        self.tmux: TmuxManager = TmuxManager(
+            capture_lines=config.PANE_CAPTURE_LIMIT,
+        )
+        self.router: MessageRouter = MessageRouter()
+        self.app: App = App(token=config.SLACK_BOT_TOKEN)
+        self.log: logging.Logger = logging.getLogger(__name__)
 
-    Args:
-        session: キャプチャ対象のセッション名。
+        self._register_handlers()
 
-    Returns:
-        画面内容のテキスト。セッションが存在しない場合は "(セッションなし)"。
-    """
-    if not tmux_session_exists(session):
-        return "(セッションなし)"
-    result = subprocess.run(
-        ["tmux", "capture-pane", "-t", session, "-p", "-l", "50"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip() or "(空)"
+    def _register_handlers(self) -> None:
+        """Register all Slack event and action handlers on the app."""
+        self.app.event("message")(self._handle_message)
+        self.app.action(re.compile(r"send_to_.*"))(self._handle_session_select)
+        self.app.action("hook_approve")(self._handle_hook_approve)
+        self.app.action("hook_deny")(self._handle_hook_deny)
 
+    # --- Authorization ---
 
-# --- メッセージ解析 ---
+    def is_allowed(self, user_id: str) -> bool:
+        """Check whether the given user ID is authorized.
 
+        Args:
+            user_id: The Slack user ID to check.
 
-def parse_mention(text: str) -> tuple[str | None, str]:
-    """テキスト先頭の @セッション名 メンションを解析する。
+        Returns:
+            True if the user is the allowed user, False otherwise.
+        """
+        return user_id == self.config.SLACK_ALLOWED_USER
 
-    '@worker1 テスト実行' のような入力から、セッション名とメッセージ本文を分離する。
+    # --- Event Handlers ---
 
-    Args:
-        text: 解析対象のテキスト。
+    def _handle_message(self, event: dict[str, Any], say: Say) -> None:
+        """Handle incoming Slack DM messages and route them appropriately.
 
-    Returns:
-        (セッション名, メッセージ本文) のタプル。
-        メンションがない場合は (None, 元のテキスト)。
-    """
-    m = re.match(r"^@(\S+)\s+(.*)", text, re.DOTALL)
-    if m:
-        return m.group(1), m.group(2).strip()
-    return None, text
+        Ignores bot messages and messages with subtypes. Routes special
+        commands (status, sessions/ls) to their handlers, and forwards
+        regular messages to tmux sessions.
 
+        Args:
+            event: The Slack event payload.
+            say: Callable to send messages back to Slack.
+        """
+        if event.get("bot_id") or event.get("subtype"):
+            return
 
-# --- Slack Bot ---
+        user: str = event.get("user", "")
+        text: str = event.get("text", "").strip()
+        channel_type: str = event.get("channel_type", "")
 
-app = App(token=SLACK_BOT_TOKEN)
+        self.log.info(
+            f"Message from user: {user}, channel_type: {channel_type}, text: {text[:50]}"
+        )
 
+        if channel_type != "im":
+            return
+        if not self.is_allowed(user):
+            self.log.warning(f"Unauthorized user: {user}")
+            return
 
-def is_allowed(user_id: str) -> bool:
-    """指定されたユーザーIDが許可リストに含まれるか確認する。
+        # Strip optional cc: prefix
+        prompt: str = self.router.strip_cc_prefix(text)
 
-    Args:
-        user_id: チェック対象の Slack ユーザーID。
+        if not prompt:
+            say("メッセージが空です。指示を入力してください。")
+            return
 
-    Returns:
-        許可されたユーザーであれば True。
-    """
-    return user_id == SLACK_ALLOWED_USER
+        # --- Special commands ---
+        if self.router.is_status_command(prompt):
+            self._handle_status(prompt, say)
+            return
 
+        if self.router.is_sessions_command(prompt):
+            self._handle_sessions_list(say)
+            return
 
-@app.event("message")
-def handle_message(event: dict[str, Any], say: Say) -> None:
-    """Slack DM メッセージを受信して適切なハンドラにルーティングする。
+        # --- @mention parsing ---
+        target_session, prompt = self.router.parse_mention(prompt)
 
-    ボットメッセージやサブタイプ付きイベントは無視する。
-    特殊コマンド（status, sessions, ls）はそれぞれ専用のハンドラへ、
-    通常メッセージは tmux セッションへの送信処理に渡す。
+        if target_session:
+            self._send_to_session(target_session, prompt, say)
+            return
 
-    Args:
-        event: Slack イベントペイロード。
-        say: Slack にメッセージを送信する関数。
-    """
-    if event.get("bot_id") or event.get("subtype"):
-        return
+        # --- Auto-detect session ---
+        sessions: list[str] = self.tmux.list_sessions()
 
-    user = event.get("user", "")
-    text = event.get("text", "").strip()
-    channel_type = event.get("channel_type", "")
+        if len(sessions) == 0:
+            say(":x: tmux セッションが見つかりません。Mac で `tcc` を実行してください。")
+            return
 
-    log.info(f"Message from user: {user}, channel_type: {channel_type}, text: {text[:50]}")
+        if len(sessions) == 1:
+            self._send_to_session(sessions[0], prompt, say)
+            return
 
-    if channel_type != "im":
-        return
-    if not is_allowed(user):
-        log.warning(f"Unauthorized user: {user}")
-        return
+        # Multiple sessions -> show button selection
+        self._show_session_buttons(sessions, prompt, say)
 
-    # cc: プレフィックス除去（オプション）
-    prompt = text
-    if text.lower().startswith("cc:"):
-        prompt = text[3:].strip()
+    def _handle_status(self, prompt: str, say: Say) -> None:
+        """Process the ``status`` command and display session state.
 
-    if not prompt:
-        say("メッセージが空です。指示を入力してください。")
-        return
+        If ``'status <session>'`` is given, shows the capture of that
+        specific session. Otherwise, shows a summary of all sessions.
 
-    # --- 特殊コマンド ---
-    cmd = prompt.lower().strip()
+        Args:
+            prompt: The user's command string.
+            say: Callable to send messages back to Slack.
+        """
+        parts: list[str] = prompt.split(maxsplit=1)
+        sessions: list[str] = self.tmux.list_sessions()
 
-    # status
-    if cmd.startswith("status"):
-        handle_status(prompt, say)
-        return
+        if len(parts) >= 2:
+            target: str = parts[1].strip()
+            if self.tmux.session_exists(target):
+                pane: str = self.tmux.capture(target)
+                if len(pane) > self.config.STATUS_PANE_MAX_LENGTH:
+                    pane = "...\n" + pane[-self.config.STATUS_PANE_MAX_LENGTH:]
+                say(f":white_check_mark: `{target}` は稼働中\n```\n{pane}\n```")
+            else:
+                say(f":x: `{target}` が見つかりません。")
+            return
 
-    # sessions / ls
-    if cmd in ("sessions", "ls"):
-        sessions = tmux_list_sessions()
         if not sessions:
             say(":x: tmux セッションが見つかりません。`tcc` で起動してください。")
             return
-        lines = [f":computer: *セッション一覧 ({len(sessions)}個)*"]
+
+        lines: list[str] = []
+        for s in sessions:
+            pane = self.tmux.capture(s)
+            last_lines: list[str] = [line for line in pane.splitlines() if line.strip()]
+            last_line: str = last_lines[-1] if last_lines else "(空)"
+            if len(last_line) > self.config.STATUS_LINE_MAX_LENGTH:
+                last_line = last_line[:self.config.STATUS_LINE_MAX_LENGTH] + "..."
+            lines.append(f":white_check_mark: `{s}`: {last_line}")
+
+        say(f":computer: セッション一覧 ({len(sessions)}個):\n" + "\n".join(lines))
+
+    def _handle_sessions_list(self, say: Say) -> None:
+        """List all running tmux sessions.
+
+        Args:
+            say: Callable to send messages back to Slack.
+        """
+        sessions: list[str] = self.tmux.list_sessions()
+        if not sessions:
+            say(":x: tmux セッションが見つかりません。`tcc` で起動してください。")
+            return
+        lines: list[str] = [f":computer: *セッション一覧 ({len(sessions)}個)*"]
         for s in sessions:
             lines.append(f"  • `{s}`")
         say("\n".join(lines))
-        return
 
-    # --- @メンション解析 ---
-    target_session, prompt = parse_mention(prompt)
+    def _send_to_session(self, session: str, prompt: str, say: Say) -> None:
+        """Send a message to the specified tmux session and notify Slack.
 
-    if target_session:
-        send_to_session(target_session, prompt, say)
-        return
+        Args:
+            session: The target tmux session name.
+            prompt: The message to send.
+            say: Callable to send messages back to Slack.
+        """
+        if not self.tmux.session_exists(session):
+            say(f":x: `{session}` が見つかりません。")
+            return
 
-    # --- セッション自動判定 ---
-    sessions = tmux_list_sessions()
+        if self.tmux.send(session, prompt):
+            self.log.info(f"Sent to tmux:{session}: {prompt[:80]}")
+            say(f":arrow_right: `{session}` に送信しました:\n> {prompt}")
+        else:
+            say(f":x: `{session}` への送信に失敗しました。")
 
-    if len(sessions) == 0:
-        say(":x: tmux セッションが見つかりません。Mac で `tcc` を実行してください。")
-        return
+    def _show_session_buttons(
+        self, sessions: list[str], prompt: str, say: Say,
+    ) -> None:
+        """Display Slack buttons for selecting a target session.
 
-    if len(sessions) == 1:
-        send_to_session(sessions[0], prompt, say)
-        return
+        Args:
+            sessions: List of available session names.
+            prompt: The message to embed in button values.
+            say: Callable to send messages back to Slack.
+        """
+        prompt_for_btn: str = prompt[:self.config.BUTTON_VALUE_MAX_LENGTH]
 
-    # セッション複数 → ボタン選択
-    # Slack button value の上限は 2000 文字。prompt を直接埋め込む。
-    prompt_for_btn = prompt[:1900]
+        buttons: list[dict[str, Any]] = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": f":computer: {name}"},
+                "action_id": f"send_to_{name}",
+                "value": json.dumps({"session": name, "prompt": prompt_for_btn}),
+            }
+            for name in sessions
+        ]
 
-    buttons = [
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": f":computer: {name}"},
-            "action_id": f"send_to_{name}",
-            "value": json.dumps({"session": name, "prompt": prompt_for_btn}),
-        }
-        for name in sessions
-    ]
-
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f":arrow_right: *送信先を選択してください:*\n> {prompt}",
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":arrow_right: *送信先を選択してください:*\n> {prompt}",
+                },
             },
-        },
-        {"type": "actions", "elements": buttons},
-    ]
+            {"type": "actions", "elements": buttons},
+        ]
 
-    say(blocks=blocks, text="送信先を選択してください")
+        say(blocks=blocks, text="送信先を選択してください")
+
+    # --- Action Handlers ---
+
+    def _handle_session_select(
+        self,
+        ack: Ack,
+        action: dict[str, Any],
+        respond: Respond,
+        say: Say,
+        body: dict[str, Any],
+    ) -> None:
+        """Handle session selection button presses.
+
+        Extracts the embedded prompt from the button value and sends
+        it to the selected tmux session.
+
+        Args:
+            ack: Acknowledge function for the Slack request.
+            action: The action payload containing the button value.
+            respond: Callable to update the original message.
+            say: Callable to send messages back to Slack.
+            body: The full request body.
+        """
+        ack()
+        user: str = body.get("user", {}).get("id", "")
+        if not self.is_allowed(user):
+            return
+
+        try:
+            data: dict[str, str] = json.loads(action["value"])
+        except (json.JSONDecodeError, KeyError):
+            respond(
+                text=":x: エラーが発生しました。もう一度送信してください。",
+                replace_original=True,
+            )
+            return
+
+        session: str = data.get("session", "")
+        prompt: str = data.get("prompt", "")
+
+        if not prompt:
+            respond(
+                text=":warning: メッセージが空です。もう一度送信してください。",
+                replace_original=True,
+            )
+            return
+
+        if self.tmux.send(session, prompt):
+            self.log.info(f"Sent to tmux:{session}: {prompt[:80]}")
+            respond(
+                text=f":arrow_right: `{session}` に送信: {prompt[:60]}",
+                replace_original=True,
+            )
+        else:
+            respond(
+                text=f":x: `{session}` への送信に失敗",
+                replace_original=True,
+            )
+
+    def _handle_hook_approve(
+        self,
+        ack: Ack,
+        action: dict[str, Any],
+        respond: Respond,
+        body: dict[str, Any],
+    ) -> None:
+        """Handle the 'approve' button from hook input notifications.
+
+        Sends ``'y'`` to the tmux session to approve the pending action.
+
+        Args:
+            ack: Acknowledge function for the Slack request.
+            action: The action payload (value contains session name).
+            respond: Callable to update the original message.
+            body: The full request body.
+        """
+        ack()
+        if not self.is_allowed(body.get("user", {}).get("id", "")):
+            return
+        session: str = action.get("value", "") or self.config.DEFAULT_SESSION
+        if self.tmux.send(session, "y"):
+            respond(
+                text=f":white_check_mark: `{session}` を許可しました",
+                replace_original=True,
+            )
+        else:
+            respond(
+                text=f":x: `{session}` への送信に失敗しました",
+                replace_original=True,
+            )
+
+    def _handle_hook_deny(
+        self,
+        ack: Ack,
+        action: dict[str, Any],
+        respond: Respond,
+        body: dict[str, Any],
+    ) -> None:
+        """Handle the 'deny' button from hook input notifications.
+
+        Sends ``'n'`` to the tmux session to reject the pending action.
+
+        Args:
+            ack: Acknowledge function for the Slack request.
+            action: The action payload (value contains session name).
+            respond: Callable to update the original message.
+            body: The full request body.
+        """
+        ack()
+        if not self.is_allowed(body.get("user", {}).get("id", "")):
+            return
+        session: str = action.get("value", "") or self.config.DEFAULT_SESSION
+        if self.tmux.send(session, "n"):
+            respond(
+                text=f":no_entry_sign: `{session}` を拒否しました",
+                replace_original=True,
+            )
+        else:
+            respond(
+                text=f":x: `{session}` への送信に失敗しました",
+                replace_original=True,
+            )
+
+    # --- Lifecycle ---
+
+    def _kill_existing(self) -> None:
+        """Terminate an existing bot process identified by the PID file."""
+        if not self.config.PID_FILE.exists():
+            return
+        try:
+            old_pid: int = int(self.config.PID_FILE.read_text().strip())
+            os.kill(old_pid, signal.SIGTERM)
+            self.log.info(f"既存プロセス (PID {old_pid}) を停止しました")
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        self.config.PID_FILE.unlink(missing_ok=True)
+
+    def _cleanup(self, _sig: int = 0, _frame: Any = None) -> None:
+        """Remove the PID file and exit on termination signals."""
+        self.config.PID_FILE.unlink(missing_ok=True)
+        sys.exit(0)
+
+    def start(self) -> None:
+        """Start the Slack Bot in Socket Mode.
+
+        Kills any existing bot process, writes the current PID file,
+        registers signal handlers, and starts the Socket Mode handler.
+        """
+        self._kill_existing()
+        self.config.PID_FILE.write_text(str(os.getpid()))
+        signal.signal(signal.SIGTERM, self._cleanup)
+        signal.signal(signal.SIGINT, self._cleanup)
+
+        self.log.info(
+            f"Slack Bot 起動中... (PID {os.getpid()}, "
+            f"default session: {self.config.DEFAULT_SESSION})"
+        )
+        try:
+            handler = SocketModeHandler(self.app, self.config.SLACK_APP_TOKEN)
+            handler.start()
+        finally:
+            self.config.PID_FILE.unlink(missing_ok=True)
+
+
+# ===================================================================
+# Backward-compatible module-level API
+# ===================================================================
+#
+# The following globals and free functions preserve backward compatibility
+# with code that imports directly from this module (e.g. existing tests,
+# hook scripts). They delegate to a module-level singleton of each class.
+# ===================================================================
+
+# --- Config singleton (created at import time) ---
+ENV_FILE = Config.ENV_FILE
+
+_config = Config()
+
+SLACK_BOT_TOKEN: str = _config.SLACK_BOT_TOKEN
+SLACK_APP_TOKEN: str = _config.SLACK_APP_TOKEN
+SLACK_ALLOWED_USER: str = _config.SLACK_ALLOWED_USER
+DEFAULT_SESSION: str = _config.DEFAULT_SESSION
+PID_FILE: Path = _config.PID_FILE
+
+_log_dir: Path = _config.LOG_DIR
+log: logging.Logger = logging.getLogger(__name__)
+
+# --- TmuxManager singleton ---
+_tmux = TmuxManager(capture_lines=_config.PANE_CAPTURE_LIMIT)
+
+
+def tmux_list_sessions() -> list[str]:
+    """Return running tmux session names (backward-compatible wrapper).
+
+    Returns:
+        A list of session name strings.
+    """
+    return _tmux.list_sessions()
+
+
+def tmux_session_exists(session: str) -> bool:
+    """Check whether a tmux session exists (backward-compatible wrapper).
+
+    Args:
+        session: The session name to check.
+
+    Returns:
+        True if the session exists.
+    """
+    return _tmux.session_exists(session)
+
+
+def tmux_send(session: str, text: str) -> bool:
+    """Send text to a tmux session (backward-compatible wrapper).
+
+    Args:
+        session: The target session name.
+        text: The text to send.
+
+    Returns:
+        True if sent successfully.
+    """
+    return _tmux.send(session, text)
+
+
+def tmux_capture(session: str) -> str:
+    """Capture tmux pane content (backward-compatible wrapper).
+
+    Args:
+        session: The session name to capture.
+
+    Returns:
+        The captured pane text.
+    """
+    return _tmux.capture(session)
+
+
+# --- MessageRouter singleton ---
+_router = MessageRouter()
+
+
+def parse_mention(text: str) -> tuple[str | None, str]:
+    """Parse a leading @mention from text (backward-compatible wrapper).
+
+    Args:
+        text: The raw message text.
+
+    Returns:
+        A tuple of (session_name, message_body).
+    """
+    return _router.parse_mention(text)
+
+
+def load_env() -> dict[str, str]:
+    """Load environment variables from the env file (backward-compatible wrapper).
+
+    Returns:
+        A dictionary of environment variable key-value pairs.
+
+    Raises:
+        FileNotFoundError: If the env file does not exist.
+    """
+    cfg = Config.__new__(Config)
+    cfg.ENV_FILE = ENV_FILE
+    return cfg._load_env()
+
+
+# --- SlackBot singleton ---
+_bot = SlackBot(_config)
+app: App = _bot.app
+
+
+def is_allowed(user_id: str) -> bool:
+    """Check whether a user is authorized (backward-compatible wrapper).
+
+    Args:
+        user_id: The Slack user ID.
+
+    Returns:
+        True if the user is allowed.
+    """
+    return _bot.is_allowed(user_id)
+
+
+def handle_message(event: dict[str, Any], say: Say) -> None:
+    """Handle a Slack message event (backward-compatible wrapper).
+
+    Args:
+        event: The Slack event payload.
+        say: Callable to send messages to Slack.
+    """
+    _bot._handle_message(event, say)
 
 
 def handle_status(prompt: str, say: Say) -> None:
-    """status コマンドを処理して、セッションの状態を Slack に返す。
-
-    'status' のみの場合は全セッションの概要を表示し、
-    'status <session>' の場合は指定セッションの画面キャプチャを表示する。
+    """Handle the status command (backward-compatible wrapper).
 
     Args:
-        prompt: ユーザーが入力したコマンド文字列。
-        say: Slack にメッセージを送信する関数。
+        prompt: The user's command string.
+        say: Callable to send messages to Slack.
     """
-    parts = prompt.split(maxsplit=1)
-    sessions = tmux_list_sessions()
-
-    if len(parts) >= 2:
-        target = parts[1].strip()
-        if tmux_session_exists(target):
-            pane = tmux_capture(target)
-            if len(pane) > 2500:
-                pane = "...\n" + pane[-2500:]
-            say(f":white_check_mark: `{target}` は稼働中\n```\n{pane}\n```")
-        else:
-            say(f":x: `{target}` が見つかりません。")
-        return
-
-    if not sessions:
-        say(":x: tmux セッションが見つかりません。`tcc` で起動してください。")
-        return
-
-    lines = []
-    for s in sessions:
-        pane = tmux_capture(s)
-        last_lines = [line for line in pane.splitlines() if line.strip()]
-        last_line = last_lines[-1] if last_lines else "(空)"
-        if len(last_line) > 80:
-            last_line = last_line[:80] + "..."
-        lines.append(f":white_check_mark: `{s}`: {last_line}")
-
-    say(f":computer: セッション一覧 ({len(sessions)}個):\n" + "\n".join(lines))
+    _bot._handle_status(prompt, say)
 
 
 def send_to_session(session: str, prompt: str, say: Say) -> None:
-    """指定された tmux セッションにメッセージを送信し、結果を Slack に通知する。
+    """Send a message to a tmux session (backward-compatible wrapper).
 
     Args:
-        session: 送信先のセッション名。
-        prompt: 送信するメッセージ。
-        say: Slack にメッセージを送信する関数。
+        session: The target session name.
+        prompt: The message to send.
+        say: Callable to send messages to Slack.
     """
-    if not tmux_session_exists(session):
-        say(f":x: `{session}` が見つかりません。")
-        return
-
-    if tmux_send(session, prompt):
-        log.info(f"Sent to tmux:{session}: {prompt[:80]}")
-        say(f":arrow_right: `{session}` に送信しました:\n> {prompt}")
-    else:
-        say(f":x: `{session}` への送信に失敗しました。")
+    _bot._send_to_session(session, prompt, say)
 
 
-# --- ボタンハンドラ ---
-
-
-# セッション選択ボタン（複数セッション時の送信先選択）
-@app.action(re.compile(r"send_to_.*"))
-def handle_session_select(
-    ack: Ack,
-    action: dict[str, Any],
-    respond: Respond,
-    say: Say,
-    body: dict[str, Any],
-) -> None:
-    """複数セッション時にユーザーが選択したセッションにメッセージを送信する。
-
-    ボタンの value にメッセージ本文が埋め込まれているため、
-    Bot 再起動やコネクション切断の影響を受けない。
-
-    Args:
-        ack: リクエスト確認応答関数。
-        action: アクションペイロード。
-        respond: 元メッセージを更新するための応答関数。
-        say: Slack にメッセージを送信する関数。
-        body: リクエストボディ全体。
-    """
-    ack()
-    user = body.get("user", {}).get("id", "")
-    if not is_allowed(user):
-        return
-
-    try:
-        data = json.loads(action["value"])
-    except (json.JSONDecodeError, KeyError):
-        respond(text=":x: エラーが発生しました。もう一度送信してください。", replace_original=True)
-        return
-
-    session = data.get("session", "")
-    prompt = data.get("prompt", "")
-
-    if not prompt:
-        respond(text=":warning: メッセージが空です。もう一度送信してください。", replace_original=True)
-        return
-
-    if tmux_send(session, prompt):
-        log.info(f"Sent to tmux:{session}: {prompt[:80]}")
-        respond(text=f":arrow_right: `{session}` に送信: {prompt[:60]}", replace_original=True)
-    else:
-        respond(text=f":x: `{session}` への送信に失敗", replace_original=True)
-
-
-# 入力待ち通知からの許可/拒否ボタン（Hook スクリプトが送信）
-@app.action("hook_approve")
-def handle_hook_approve(
-    ack: Ack,
-    action: dict[str, Any],
-    respond: Respond,
-    body: dict[str, Any],
-) -> None:
-    """入力待ち通知の許可ボタンが押された時に 'y' を tmux セッションに送信する。
-
-    Args:
-        ack: リクエスト確認応答関数。
-        action: アクションペイロード（value にセッション名を含む）。
-        respond: 元メッセージを更新するための応答関数。
-        body: リクエストボディ全体。
-    """
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    session = action.get("value", "") or DEFAULT_SESSION
-    if tmux_send(session, "y"):
-        respond(text=f":white_check_mark: `{session}` を許可しました", replace_original=True)
-    else:
-        respond(text=f":x: `{session}` への送信に失敗しました", replace_original=True)
-
-
-@app.action("hook_deny")
-def handle_hook_deny(
-    ack: Ack,
-    action: dict[str, Any],
-    respond: Respond,
-    body: dict[str, Any],
-) -> None:
-    """入力待ち通知の拒否ボタンが押された時に 'n' を tmux セッションに送信する。
-
-    Args:
-        ack: リクエスト確認応答関数。
-        action: アクションペイロード（value にセッション名を含む）。
-        respond: 元メッセージを更新するための応答関数。
-        body: リクエストボディ全体。
-    """
-    ack()
-    if not is_allowed(body.get("user", {}).get("id", "")):
-        return
-    session = action.get("value", "") or DEFAULT_SESSION
-    if tmux_send(session, "n"):
-        respond(text=f":no_entry_sign: `{session}` を拒否しました", replace_original=True)
-    else:
-        respond(text=f":x: `{session}` への送信に失敗しました", replace_original=True)
-
-
-# --- PID ファイルによる多重起動防止 ---
-
-PID_FILE = _log_dir / "bot.pid"
-
-
-def _kill_existing() -> None:
-    """既存の Bot プロセスを PID ファイルから特定して停止する。"""
-    if not PID_FILE.exists():
-        return
-    try:
-        old_pid = int(PID_FILE.read_text().strip())
-        os.kill(old_pid, signal.SIGTERM)
-        log.info(f"既存プロセス (PID {old_pid}) を停止しました")
-    except (ValueError, ProcessLookupError, PermissionError):
-        pass
-    PID_FILE.unlink(missing_ok=True)
-
-
-def _cleanup(_sig: int = 0, _frame: Any = None) -> None:
-    """終了時に PID ファイルを削除する。"""
-    PID_FILE.unlink(missing_ok=True)
-    sys.exit(0)
-
-
-# --- 起動 ---
+# --- Entry point ---
 
 
 def main() -> None:
-    """Slack Bot を Socket Mode で起動する。"""
-    _kill_existing()
-    PID_FILE.write_text(str(os.getpid()))
-    signal.signal(signal.SIGTERM, _cleanup)
-    signal.signal(signal.SIGINT, _cleanup)
-
-    log.info(f"Slack Bot 起動中... (PID {os.getpid()}, default session: {DEFAULT_SESSION})")
-    try:
-        handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-        handler.start()
-    finally:
-        PID_FILE.unlink(missing_ok=True)
+    """Start the Slack Bot in Socket Mode."""
+    _bot.start()
 
 
 if __name__ == "__main__":
