@@ -1,109 +1,160 @@
 ![CI](https://github.com/sohei-t/slack-bridge-for-claude-code/actions/workflows/ci.yml/badge.svg)
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![Slack](https://img.shields.io/badge/Slack-Socket_Mode-4A154B?logo=slack&logoColor=white)
+![tmux](https://img.shields.io/badge/tmux-terminal_multiplexer-1BB91F)
 
 # Slack Bridge for Claude Code
 
-Bidirectional bridge between Slack and [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Control Claude Code from your phone via Slack Bot DM.
+A bidirectional integration tool that bridges [Slack](https://slack.com) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code), letting you control Claude Code from your phone via Slack Bot DM. Receive real-time notifications when tasks complete or when Claude needs permission, and send instructions back -- all without touching your Mac.
 
-## What it does
+---
 
-```
-iPhone (Slack)  <->  Mac (bot.py)  <->  tmux  <->  Claude Code
-```
+## The Problem
 
-| Direction | Feature | Details |
-|-----------|---------|---------|
-| Mac -> Phone | Task completion notification | Shows Claude's response summary + tmux screen capture |
-| Mac -> Phone | Permission prompt notification | Shows what Claude is asking + **Approve / Deny** buttons |
-| Phone -> Mac | Send instructions | Type in Slack DM -> delivered to Claude Code |
-| Phone -> Mac | Check status | `status` command shows current tmux screen |
-| Phone -> Mac | Multi-session support | `@session_name` mention or auto session picker |
+When Claude Code runs long tasks on your Mac, you have no way to know when it finishes unless you are sitting at your desk. If Claude needs permission to execute a command, it blocks until you physically walk over and type `y`. This tool eliminates that friction entirely.
+
+## The Solution
+
+Slack Bridge creates a two-way communication channel between your phone and Claude Code:
+
+- **Mac to Phone**: Automatic notifications for task completion and permission prompts
+- **Phone to Mac**: Send instructions, approve/deny permissions, and check status -- all from Slack DM
+
+---
 
 ## Architecture
 
 ```
-+----------------------------------------------+
-|  Your Mac (always-on)                         |
-|                                               |
-|  +-------------+   +---------------------+   |
-|  | bot.py      |   | tmux "claude"       |   |
-|  | (Slack API  |-->|  +---------------+   |   |
-|  |  client)    |   |  | Claude Code   |   |   |
-|  +-------------+   |  +-------+-------+   |   |
-|                     +---------++-----------+   |
-|  +-------------+              ||               |
-|  | Hook scripts|<-------------+|               |
-|  | (auto-fired |  Stop / Notification event    |
-|  |  by Claude) |--> Slack Bot DM               |
-|  +-------------+                               |
-+------------------------------------------------+
-         | Internet (Slack API, Socket Mode)
-+------------------+
-|  Phone (Slack)   |
-|  - Get notified  |
-|  - Tap buttons   |
-|  - Send commands |
-+------------------+
++--------------------------------------------------------------+
+|  Your Mac (always-on)                                        |
+|                                                              |
+|  +-----------------+       +---------------------------+     |
+|  | bot.py          |       | tmux sessions             |     |
+|  | (Socket Mode)   |------>|  +---------------------+  |     |
+|  |                 |       |  | Claude Code (main)  |  |     |
+|  | Receives Slack  |       |  +---------------------+  |     |
+|  | messages and    |       |  | Claude Code (worker)|  |     |
+|  | button actions  |       |  +---------------------+  |     |
+|  +-----------------+       +-------------+-------------+     |
+|                                          |                   |
+|  +-----------------+                     |                   |
+|  | Hook Scripts    |<--------------------+                   |
+|  |                 |  Claude Code events:                    |
+|  | slack-notify.sh |  - Stop (task complete)                 |
+|  | slack-notify-   |  - Notification (permission prompt)     |
+|  |   waiting.sh    |                                         |
+|  +-----------------+                                         |
+|          |                                                   |
++----------|---------------------------------------------------+
+           | Slack API (HTTPS)
+           v
++--------------------------------------------------------------+
+|  Slack API (api.slack.com)                                   |
+|  - Socket Mode WebSocket (bot.py <-> Slack)                  |
+|  - REST API (hook scripts -> Slack)                          |
++--------------------------------------------------------------+
+           ^
+           |
++--------------------+
+|  Phone (Slack App) |
+|  - Notifications   |
+|  - Approve / Deny  |
+|  - Send commands   |
++--------------------+
 ```
+
+**Data flow summary:**
+
+| Path | Mechanism | Purpose |
+|------|-----------|---------|
+| Phone -> Mac | Slack Socket Mode -> `bot.py` -> `tmux send-keys` | Send instructions to Claude Code |
+| Mac -> Phone | Claude Code hook -> `slack-notify.sh` -> Slack REST API | Task completion notification |
+| Mac -> Phone | Claude Code hook -> `slack-notify-waiting.sh` -> Slack REST API | Permission prompt with Approve/Deny buttons |
+| Phone -> Mac | Slack Button Action -> `bot.py` -> `tmux send-keys` | One-tap approve (`y`) or deny (`n`) |
+
+---
 
 ## Features
 
+### Bidirectional Communication
+
+| Direction | Feature | Details |
+|-----------|---------|---------|
+| Mac -> Phone | Task completion notification | Claude's response summary + tmux screen capture |
+| Mac -> Phone | Permission prompt notification | Prompt details + **Approve / Deny** buttons (Block Kit) |
+| Phone -> Mac | Send instructions | Type in Slack DM, delivered to Claude Code via tmux |
+| Phone -> Mac | Check status | `status` command shows current tmux screen content |
+| Phone -> Mac | Multi-session support | `@session_name` mention or interactive session picker |
+
 ### Notifications
 
-- **Task completion**: When Claude finishes, you get a notification with Claude's response summary and a tmux screen capture (no buttons -- just informational)
-- **Permission prompt**: When Claude needs approval, you get the prompt details with **Approve** and **Deny** buttons for one-tap response
+- **Task completion**: When Claude finishes a task, you receive a notification containing Claude's response summary and a tmux screen capture. No action buttons -- purely informational.
+- **Permission prompt**: When Claude needs approval (e.g., to run a shell command), you receive the prompt details with **Approve** and **Deny** buttons for one-tap response via Slack's Block Kit interactive components.
 
-### Multi-session support
+### Multi-Session Support
 
-Run multiple Claude Code instances in separate tmux sessions and control them all from Slack:
+Run multiple Claude Code instances in separate tmux sessions and control them all from a single Slack DM:
 
-- **Auto-detection**: If only one session exists, messages are sent automatically
+- **Auto-detection**: If only one tmux session exists, messages route automatically
 - **Session picker**: If multiple sessions exist, Block Kit buttons let you choose the target
 - **Direct mention**: `@worker1 run tests` sends directly to the `worker1` session
+- **Status overview**: `status` shows all sessions with their last output line
 
-### Commands
+### Security
 
-| Command | Description |
-|---------|-------------|
-| `<any text>` | Send instruction to Claude Code (auto-routed) |
-| `@session_name <text>` | Send to a specific tmux session |
-| `status` | Show all sessions with last output line |
-| `status <session>` | Show full screen capture of a specific session |
-| `sessions` / `ls` | List all active tmux sessions |
-| `y` / `n` | Approve or deny (auto-routed like any text) |
-| `cc: <text>` | Same as `<text>` (cc: prefix is optional) |
+- **Allowed user filtering**: Only the configured Slack user ID can interact with the bot
+- **Unauthorized requests are silently ignored**: No information leakage to other users
+- **PID-based process management**: Prevents duplicate bot instances
+
+### Hook-Based Integration
+
+The bridge uses Claude Code's native hook system -- no polling, no custom Claude Code modifications:
+
+- **Stop hook** (`slack-notify.sh`): Fires when Claude finishes a task
+- **Notification hook** (`slack-notify-waiting.sh`): Fires on permission prompts (matched by `permission_prompt`)
+
+Both hooks run as background processes to avoid blocking Claude Code.
+
+---
 
 ## Quick Start
 
-### 1. Install dependencies
+### Prerequisites
+
+- macOS (or Linux with tmux)
+- Python 3.10+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
+- A Slack workspace where you can create apps
+
+### Step 1: Install Dependencies
 
 ```bash
 pip3 install slack_bolt slack_sdk
-brew install tmux  # if not installed
+brew install tmux  # if not already installed
 ```
 
-### 2. Create a Slack App
+### Step 2: Create a Slack App
 
-1. Go to https://api.slack.com/apps -> **Create New App** -> **From scratch**
-2. Name it (e.g., `Claude Code Bridge`)
+1. Go to [https://api.slack.com/apps](https://api.slack.com/apps) -> **Create New App** -> **From scratch**
+2. Name it (e.g., `Claude Code Bridge`) and select your workspace
 3. Enable **Socket Mode**:
-   - Basic Information -> App-Level Tokens -> Generate Token
+   - Navigate to **Basic Information** -> **App-Level Tokens** -> **Generate Token**
    - Scope: `connections:write`
    - Save the `xapp-...` token
-4. Add **Bot Token Scopes** (OAuth & Permissions):
-   - `chat:write` - Send messages
-   - `im:history` - Read DM history
-   - `im:write` - Open DM channels
-   - `users:read` - Read user info
+4. Add **Bot Token Scopes** under **OAuth & Permissions**:
+   - `chat:write` -- Send messages
+   - `im:history` -- Read DM history
+   - `im:write` -- Open DM channels
+   - `users:read` -- Read user info
 5. Enable **Event Subscriptions**:
    - Subscribe to bot event: `message.im`
-6. **Install to Workspace**
+6. **Install to Workspace**:
    - Save the `xoxb-...` Bot User OAuth Token
 7. Find your **Slack User ID**:
-   - Click your profile -> **...** -> **Copy member ID**
+   - Click your profile in Slack -> **...** -> **Copy member ID**
 
-### 3. Configure
+### Step 3: Configure Environment Variables
 
 ```bash
 cp .env.example .env
@@ -114,13 +165,13 @@ Or add to `~/.config/ai-agents/profiles/default.env`:
 
 ```
 SLACK_NOTIFY_ENABLED=true
-SLACK_BOT_TOKEN=xoxb-your-token
-SLACK_APP_TOKEN=xapp-your-token
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
 SLACK_ALLOWED_USER=U0000000000
 TMUX_SESSION_NAME=claude
 ```
 
-### 4. Deploy
+### Step 4: Deploy Files
 
 ```bash
 # Bot
@@ -134,7 +185,7 @@ cp hooks/slack-notify-waiting.sh ~/.claude/hooks/
 chmod +x ~/.claude/hooks/slack-notify*.sh
 ```
 
-### 5. Configure Claude Code hooks
+### Step 5: Configure Claude Code Hooks
 
 Add to `~/.claude/settings.json`:
 
@@ -145,7 +196,10 @@ Add to `~/.claude/settings.json`:
       {
         "matcher": "",
         "hooks": [
-          {"type": "command", "command": "bash ~/.claude/hooks/slack-notify.sh"}
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/slack-notify.sh"
+          }
         ]
       }
     ],
@@ -153,7 +207,10 @@ Add to `~/.claude/settings.json`:
       {
         "matcher": "permission_prompt",
         "hooks": [
-          {"type": "command", "command": "bash ~/.claude/hooks/slack-notify-waiting.sh"}
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/slack-notify-waiting.sh"
+          }
         ]
       }
     ]
@@ -161,30 +218,73 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### 6. Start
+> **Note**: If you already have hooks configured, merge these entries into the existing arrays rather than overwriting.
+
+### Step 6: Start
 
 ```bash
-# Recommended: add tcc function to ~/.zshrc (auto-starts bot)
-tcc           # Creates tmux session + starts Claude Code + starts bot
-
-# Or manually:
+# Start a tmux session with Claude Code
 tmux new -s claude
-# Inside tmux: claude
+# Inside tmux, run: claude
 
-# In another terminal:
+# In a separate terminal, start the bot
 cd ~/.claude/slack-bot && nohup python3 bot.py >> bot.log 2>&1 &
 ```
 
-### 7. Test
+### Step 7: Verify
 
 Send a message to your bot's DM in Slack:
-- `status` -> See tmux screen content
-- `hello` -> Sends "hello" to Claude Code
-- `sessions` -> List all active tmux sessions
 
-## Auto bot startup with `tcc`
+- `status` -- See tmux screen content
+- `sessions` -- List all active tmux sessions
+- `hello` -- Sends "hello" to Claude Code
 
-Add this to your `~/.zshrc` to automatically start the Slack bot whenever you use `tcc`:
+---
+
+## Commands Reference
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `<any text>` | Send instruction to Claude Code (auto-routed) | `run the tests` |
+| `@session <text>` | Send to a specific tmux session | `@worker1 deploy to staging` |
+| `status` | Show all sessions with last output line | `status` |
+| `status <session>` | Show full screen capture of a session | `status worker1` |
+| `sessions` | List all active tmux sessions | `sessions` |
+| `ls` | Alias for `sessions` | `ls` |
+| `y` / `n` | Approve or deny (auto-routed) | `y` |
+| `cc: <text>` | Same as `<text>` (`cc:` prefix is optional) | `cc: fix the bug` |
+
+### Interactive Elements
+
+| Element | When It Appears | Action |
+|---------|-----------------|--------|
+| **Approve** button | Permission prompt notification | Sends `y` to the correct tmux session |
+| **Deny** button | Permission prompt notification | Sends `n` to the correct tmux session |
+| **Session picker** buttons | Multiple tmux sessions active | Routes your message to the selected session |
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `SLACK_NOTIFY_ENABLED` | Yes | Enable/disable notifications | `true` |
+| `SLACK_BOT_TOKEN` | Yes | Bot User OAuth Token from Slack | `xoxb-...` |
+| `SLACK_APP_TOKEN` | Yes | App-Level Token for Socket Mode | `xapp-...` |
+| `SLACK_ALLOWED_USER` | Yes | Your Slack User ID (security filter) | `U0123456789` |
+| `TMUX_SESSION_NAME` | No | Default tmux session name | `claude` (default) |
+
+### Configuration File Location
+
+The bot reads environment variables from `~/.config/ai-agents/profiles/default.env`. Alternatively, you can use a `.env` file in the project directory.
+
+---
+
+## Auto-Start with `tcc`
+
+Add the following to your `~/.zshrc` to automatically start the Slack bot and Claude Code together:
 
 ```bash
 # Slack Bot auto-start (kill existing -> restart)
@@ -223,26 +323,45 @@ atcc() {
 }
 ```
 
-The bot is killed and restarted each time `tcc` runs. This is safe -- bot.py is completely independent from tmux sessions. Restarting it has zero impact on running Claude Code instances.
+The bot process is fully independent from tmux sessions. Restarting it has zero impact on running Claude Code instances.
 
-## Multi-session usage
+---
+
+## Multi-Session Usage
 
 ```bash
 # Terminal 1: main session
-tcc claude
+tcc main-project
 
 # Terminal 2: worker session
 tcc worker1
 
 # From Slack:
-# "run tests" -> session picker buttons appear (choose claude or worker1)
-# "@worker1 run tests" -> sends directly to worker1
-# "status" -> shows both sessions
+# "run tests"             -> session picker buttons appear
+# "@worker1 run tests"    -> sends directly to worker1
+# "status"                -> shows both sessions with last output
 ```
 
-## Agent Skill (optional)
+---
 
-If you use Claude Code's Agent Skills feature, copy the skill for quick management:
+## Deployment Modes
+
+### Direct Deployment (Recommended)
+
+Copy files manually as described in the [Quick Start](#quick-start) section. This gives you full control over file placement and configuration.
+
+```
+~/.claude/
+  slack-bot/
+    bot.py              # Slack bot (Socket Mode)
+  hooks/
+    slack-notify.sh     # Task completion hook
+    slack-notify-waiting.sh  # Permission prompt hook
+```
+
+### Skill Deployment (Optional)
+
+If you use Claude Code's Agent Skills feature, deploy as a skill for management via slash commands:
 
 ```bash
 mkdir -p ~/.claude/skills/slack-bridge/hooks
@@ -252,35 +371,136 @@ cp skill/hooks/slack-notify.sh ~/.claude/skills/slack-bridge/hooks/
 cp skill/hooks/slack-notify-waiting.sh ~/.claude/skills/slack-bridge/hooks/
 ```
 
-Then use:
-- `/slack-bridge setup` - Guided first-time setup
-- `/slack-bridge start` - Start the bot
-- `/slack-bridge stop` - Stop the bot
-- `/slack-bridge status` - Check all components
+Skill commands:
+
+| Command | Description |
+|---------|-------------|
+| `/slack-bridge setup` | Guided first-time setup |
+| `/slack-bridge start` | Start the bot |
+| `/slack-bridge stop` | Stop the bot |
+| `/slack-bridge status` | Check all components |
+
+---
 
 ## How It Works
 
-**bot.py** bridges two APIs:
-- **Slack API** (Socket Mode) - receives messages from your phone
-- **tmux CLI** (`send-keys` / `capture-pane`) - injects text into Claude Code
+### Bot (`bot.py`)
 
-When multiple tmux sessions are running, the bot auto-detects them and presents session picker buttons. You can also use `@session_name` to target a specific session directly.
+The bot bridges two interfaces:
 
-**Hook scripts** are triggered automatically by Claude Code events:
-- **Stop hook** (`slack-notify.sh`) -> fires when Claude finishes a task -> sends completion notification with Claude's response summary and tmux screen capture
-- **Notification hook** (`slack-notify-waiting.sh`) -> fires when Claude needs permission -> sends prompt details with **Approve** and **Deny** buttons
+- **Slack API** via Socket Mode -- receives messages and button actions from your phone in real time
+- **tmux CLI** via `send-keys` / `capture-pane` -- injects text into Claude Code and reads screen output
 
-The Approve/Deny buttons use Slack's Block Kit interactive components. When you tap a button, the bot receives the action via Socket Mode and sends `y` or `n` to the correct tmux session. These are the **only** buttons in the system -- everything else is handled by typing text.
+tmux provides the critical capability that regular terminals lack: **external I/O access**. `send-keys` injects input as if typed on the keyboard, while `capture-pane` reads the current screen contents.
 
-tmux provides the critical capability that regular terminals lack: **external I/O access** via `send-keys` (inject input) and `capture-pane` (read screen output).
+### Hook Scripts
+
+Hook scripts are triggered automatically by Claude Code's event system:
+
+1. **Stop event** (`slack-notify.sh`):
+   - Reads the hook payload from stdin (JSON with `cwd`, `last_assistant_message`)
+   - Auto-detects the current tmux session name
+   - Captures the tmux pane content (last 20 lines)
+   - Sends a Block Kit notification to your Slack DM with Claude's response summary and screen capture
+
+2. **Notification event** (`slack-notify-waiting.sh`):
+   - Reads the hook payload from stdin (JSON with `cwd`, `message`)
+   - Captures the tmux pane to show the actual permission prompt
+   - Sends a Block Kit notification with **Approve** and **Deny** buttons
+   - Button values include the tmux session name, ensuring actions route to the correct session
+
+### Button Actions
+
+When you tap **Approve** or **Deny** in Slack, the bot receives the action via Socket Mode and sends `y` or `n` to the correct tmux session. The session name is embedded in the button value, making multi-session approval reliable.
+
+### PID-Based Process Management
+
+The bot writes its PID to `~/.claude/slack-bot/bot.pid` on startup. If a previous instance is running, it is terminated before the new instance starts. This prevents duplicate bot processes.
+
+---
+
+## Project Structure
+
+```
+slack-bridge-for-claude-code/
+  bot/
+    bot.py                  # Main bot (Socket Mode + tmux integration)
+    requirements.txt        # Python dependencies
+  hooks/
+    slack-notify.sh         # Stop hook (task completion notification)
+    slack-notify-waiting.sh # Notification hook (permission prompt)
+  skill/
+    SKILL.md                # Claude Code Agent Skill definition
+    bot.py                  # Bot copy for skill deployment
+    hooks/
+      slack-notify.sh
+      slack-notify-waiting.sh
+  tests/
+    conftest.py             # Shared pytest fixtures
+    test_bot.py             # Comprehensive test suite
+  .github/
+    workflows/
+      ci.yml                # GitHub Actions CI (flake8, mypy, pytest)
+  .env.example              # Environment variable template
+  pyproject.toml            # Project metadata and tool configuration
+  LICENSE                   # MIT License
+```
+
+---
+
+## Testing
+
+The project includes a comprehensive test suite covering tmux helpers, message parsing, authorization, and Slack event handler behavior.
+
+```bash
+# Install dev dependencies
+pip install pytest flake8 mypy slack-bolt slack-sdk
+
+# Run tests
+pytest tests/ -v
+
+# Run linting
+flake8 bot/ --max-line-length=120
+
+# Run type checking
+mypy bot/ --ignore-missing-imports
+```
+
+### CI/CD
+
+GitHub Actions runs on every push and pull request to `main`:
+
+- **flake8** -- Code style and linting
+- **mypy** -- Static type checking
+- **pytest** -- Unit tests
+
+---
 
 ## Requirements
 
-- macOS (or Linux with tmux)
+- macOS or Linux with tmux
 - Python 3.10+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (MAX subscription recommended)
 - A Slack workspace where you can create apps
 
+---
+
+## Contributing
+
+Contributions are welcome. To get started:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-feature`)
+3. Make your changes and ensure all tests pass (`pytest tests/ -v`)
+4. Run linting and type checks (`flake8 bot/` and `mypy bot/`)
+5. Commit your changes and open a pull request
+
+Please follow the existing code style and include tests for new functionality.
+
+---
+
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2025 sohei-t
