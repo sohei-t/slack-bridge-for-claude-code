@@ -4,6 +4,9 @@ set -euo pipefail
 # Claude Code の Stop フックから呼び出され、タスク完了時に Bot DM に通知を送信する
 # tmux の画面内容も含めて送信する
 
+# デバッグログ
+echo "$(date '+%Y-%m-%d %H:%M:%S') [slack-notify] Hook fired" >> "$HOME/.claude/slack-bot/hook.log"
+
 ENV_FILE="$HOME/.config/ai-agents/profiles/default.env"
 
 # 環境変数読み込み
@@ -34,6 +37,9 @@ export ALLOWED_USER="$SLACK_ALLOWED_USER"
 python3 << 'PYEOF'
 import json, subprocess, sys, os, urllib.request
 from datetime import datetime
+from pathlib import Path
+
+PENDING_FILE = Path.home() / ".claude/slack-bot/pending_approvals.json"
 
 # 入力解析
 try:
@@ -63,11 +69,37 @@ try:
 except:
     pass
 
+# --- 未解決の入力待ち通知を「許可済み」に更新 ---
+if PENDING_FILE.exists():
+    try:
+        pending = json.loads(PENDING_FILE.read_text())
+    except:
+        pending = []
+    for entry in pending:
+        try:
+            resolve_text = ":white_check_mark: *ローカルで許可済み*"
+            update_payload = {
+                "channel": entry["channel"],
+                "ts": entry["ts"],
+                "text": resolve_text,
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": resolve_text}}],
+            }
+            req = urllib.request.Request(
+                "https://slack.com/api/chat.update",
+                data=json.dumps(update_payload).encode("utf-8"),
+                headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except:
+            pass
+    PENDING_FILE.unlink(missing_ok=True)
+
 # tmux 画面キャプチャ（末尾20行）
 pane_content = ""
 try:
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", tmux_session, "-p", "-l", "30"],
+        ["tmux", "capture-pane", "-t", tmux_session, "-p", "-S", "-30"],
         capture_output=True, text=True, timeout=5
     )
     if result.returncode == 0:

@@ -34,6 +34,8 @@ import sys
 import re
 import subprocess
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -241,7 +243,7 @@ class TmuxManager:
             return "(セッションなし)"
         capture_count = lines if lines is not None else self.capture_lines
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p", "-l", str(capture_count)],
+            ["tmux", "capture-pane", "-t", session, "-p", "-S", f"-{capture_count}"],
             capture_output=True, text=True,
         )
         return result.stdout.strip() or "(空)"
@@ -356,6 +358,8 @@ class SlackBot:
         app: The Slack Bolt ``App`` instance.
         log: The logger for this bot instance.
     """
+
+    PENDING_APPROVALS_FILE: Path = Path.home() / ".claude/slack-bot/pending_approvals.json"
 
     def __init__(self, config: Config) -> None:
         """Initialize the SlackBot with the given configuration.
@@ -646,6 +650,7 @@ class SlackBot:
         if not self.is_allowed(body.get("user", {}).get("id", "")):
             return
         session: str = action.get("value", "") or self.config.DEFAULT_SESSION
+        self.clear_pending_approvals()
         if self.tmux.send(session, "y"):
             respond(
                 text=f":white_check_mark: `{session}` を許可しました",
@@ -678,6 +683,7 @@ class SlackBot:
         if not self.is_allowed(body.get("user", {}).get("id", "")):
             return
         session: str = action.get("value", "") or self.config.DEFAULT_SESSION
+        self.clear_pending_approvals()
         if self.tmux.send(session, "n"):
             respond(
                 text=f":no_entry_sign: `{session}` を拒否しました",
@@ -688,6 +694,84 @@ class SlackBot:
                 text=f":x: `{session}` への送信に失敗しました",
                 replace_original=True,
             )
+
+    # --- Pending Approvals ---
+
+    def clear_pending_approvals(self) -> None:
+        """Remove the pending approvals file when a Slack button is pressed."""
+        self.PENDING_APPROVALS_FILE.unlink(missing_ok=True)
+
+    def _resolve_slack_messages(self, entries: list[dict[str, Any]]) -> None:
+        """Update unresolved Slack notifications to show 'locally approved'."""
+        import urllib.request
+        resolve_text = ":white_check_mark: *ローカルで許可済み*"
+        for entry in entries:
+            try:
+                payload = {
+                    "channel": entry["channel"],
+                    "ts": entry["ts"],
+                    "text": resolve_text,
+                    "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": resolve_text}}],
+                }
+                req = urllib.request.Request(
+                    "https://slack.com/api/chat.update",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {self.config.SLACK_BOT_TOKEN}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=10)
+            except Exception as e:
+                self.log.warning(f"Failed to resolve Slack message: {e}")
+
+    def _poll_pending_approvals(self) -> None:
+        """Background thread: monitor tmux pane changes to detect local approvals."""
+        self.log.info("Polling thread started for pending approvals")
+        while True:
+            time.sleep(3)
+            if not self.PENDING_APPROVALS_FILE.exists():
+                continue
+            try:
+                pending = json.loads(self.PENDING_APPROVALS_FILE.read_text())
+            except Exception:
+                continue
+            if not pending:
+                continue
+
+            resolved = []
+            for entry in pending:
+                session = entry.get("session", "")
+                snapshot = entry.get("pane_snapshot")
+                if not session:
+                    resolved.append(entry)
+                    continue
+                result = subprocess.run(
+                    ["tmux", "capture-pane", "-t", session, "-p", "-S", "-5"],
+                    capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    continue
+                current = result.stdout.strip()
+                if not snapshot:
+                    entry["pane_snapshot"] = current
+                    try:
+                        self.PENDING_APPROVALS_FILE.write_text(json.dumps(pending))
+                    except Exception:
+                        pass
+                    continue
+                if current != snapshot:
+                    self.log.info(f"Pane change detected for session '{session}', resolving notification")
+                    resolved.append(entry)
+
+            if resolved:
+                self._resolve_slack_messages(resolved)
+                remaining = [e for e in pending if e not in resolved]
+                if remaining:
+                    self.PENDING_APPROVALS_FILE.write_text(json.dumps(remaining))
+                else:
+                    self.PENDING_APPROVALS_FILE.unlink(missing_ok=True)
 
     # --- Lifecycle ---
 
@@ -723,6 +807,10 @@ class SlackBot:
             f"Slack Bot 起動中... (PID {os.getpid()}, "
             f"default session: {self.config.DEFAULT_SESSION})"
         )
+
+        poller = threading.Thread(target=self._poll_pending_approvals, daemon=True)
+        poller.start()
+
         try:
             handler = SocketModeHandler(self.app, self.config.SLACK_APP_TOKEN)
             handler.start()
@@ -879,6 +967,15 @@ def send_to_session(session: str, prompt: str, say: Say) -> None:
         say: Callable to send messages to Slack.
     """
     _bot._send_to_session(session, prompt, say)
+
+
+# --- Pending approvals backward-compatible API ---
+PENDING_APPROVALS_FILE: Path = SlackBot.PENDING_APPROVALS_FILE
+
+
+def clear_pending_approvals() -> None:
+    """Clear pending approvals (backward-compatible wrapper)."""
+    _bot.clear_pending_approvals()
 
 
 # --- Entry point ---

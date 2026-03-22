@@ -4,6 +4,9 @@ set -euo pipefail
 # Claude Code の Notification フックから呼び出され、承認待ち時に Bot DM に通知を送信する
 # tmux 画面キャプチャを含めて、何を問われているかを明確に伝える
 
+# デバッグログ
+echo "$(date '+%Y-%m-%d %H:%M:%S') [slack-notify-waiting] Hook fired" >> "$HOME/.claude/slack-bot/hook.log"
+
 ENV_FILE="$HOME/.config/ai-agents/profiles/default.env"
 
 # 環境変数読み込み
@@ -34,6 +37,9 @@ export ALLOWED_USER="$SLACK_ALLOWED_USER"
 python3 << 'PYEOF'
 import json, subprocess, sys, os, urllib.request
 from datetime import datetime
+from pathlib import Path
+
+PENDING_FILE = Path.home() / ".claude/slack-bot/pending_approvals.json"
 
 # 入力解析
 try:
@@ -63,11 +69,40 @@ try:
 except:
     pass
 
+# --- 前回の未解決通知を「許可済み」に更新 ---
+def resolve_pending(token, resolve_text=":white_check_mark: *ローカルで許可済み*"):
+    if not PENDING_FILE.exists():
+        return
+    try:
+        pending = json.loads(PENDING_FILE.read_text())
+    except:
+        pending = []
+    for entry in pending:
+        try:
+            update_payload = {
+                "channel": entry["channel"],
+                "ts": entry["ts"],
+                "text": resolve_text,
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": resolve_text}}],
+            }
+            req = urllib.request.Request(
+                "https://slack.com/api/chat.update",
+                data=json.dumps(update_payload).encode("utf-8"),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except:
+            pass
+    PENDING_FILE.unlink(missing_ok=True)
+
+resolve_pending(bot_token)
+
 # tmux 画面キャプチャ（末尾部分）- 実際の許可プロンプト内容を取得
 pane_content = ""
 try:
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", tmux_session, "-p", "-l", "40"],
+        ["tmux", "capture-pane", "-t", tmux_session, "-p", "-S", "-40"],
         capture_output=True, text=True, timeout=5
     )
     if result.returncode == 0:
@@ -146,10 +181,34 @@ req2 = urllib.request.Request(
     headers=headers,
     method="POST",
 )
+msg_ts = ""
 try:
-    urllib.request.urlopen(req2, timeout=10)
+    with urllib.request.urlopen(req2, timeout=10) as resp:
+        msg_ts = json.loads(resp.read()).get("ts", "")
 except:
     pass
+
+# 送信したメッセージ情報を保存（次回フック発火時に更新するため）
+if channel_id and msg_ts:
+    pending = []
+    if PENDING_FILE.exists():
+        try:
+            pending = json.loads(PENDING_FILE.read_text())
+        except:
+            pass
+    # tmux 末尾5行をスナップショットとして保存（Bot のポーリングで画面変化を検出するため）
+    snapshot = ""
+    try:
+        snap_result = subprocess.run(
+            ["tmux", "capture-pane", "-t", tmux_session, "-p", "-S", "-5"],
+            capture_output=True, text=True, timeout=3
+        )
+        if snap_result.returncode == 0:
+            snapshot = snap_result.stdout.strip()
+    except:
+        pass
+    pending.append({"channel": channel_id, "ts": msg_ts, "session": tmux_session, "pane_snapshot": snapshot})
+    PENDING_FILE.write_text(json.dumps(pending))
 
 PYEOF
 ) &
